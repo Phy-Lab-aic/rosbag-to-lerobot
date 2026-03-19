@@ -1,0 +1,12 @@
+services:
+  conversion:
+    image: conversion_v3
+    container_name: conversion_v3
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.conversion
+    volumes:
+      - ${INPUT_DIR:-../data/raw}:/data/raw:ro
+      - ${OUTPUT_DIR:-../data/lerobot}:/data/lerobot
+    stdin_open: true
+    tty: true

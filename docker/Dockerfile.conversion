@@ -1,0 +1,82 @@
+# Standalone MCAP-to-LeRobot conversion container (no ROS2)
+FROM python:3.12-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libturbojpeg0-dev \
+    git \
+ && rm -rf /var/lib/apt/lists/*
+
+# torch-stub (PyTorch 731MB → ~10KB)
+COPY docker/torch-stub /tmp/torch-stub
+RUN pip install --no-cache-dir /tmp/torch-stub \
+ && rm -rf /tmp/torch-stub
+
+# Python dependencies
+RUN pip install --no-cache-dir \
+      "numpy==2.2.6" \
+      "opencv-python-headless>=4.9.0,<4.13.0" \
+      "av>=15.0.0,<16.0.0" \
+      "pyarrow>=15.0.0" \
+      "imageio>=2.34.0,<3.0.0" \
+      "pillow>=10.0.0" \
+      "pyyaml>=6.0" \
+      "pandas>=2.0.0" \
+      "mcap>=0.0.10" \
+      "mcap-ros2-support>=0.5.0" \
+      datasets requests tqdm packaging fsspec
+
+# lerobot (editable install, no-deps — transitive deps already installed above)
+COPY lerobot /app/lerobot
+RUN cd /app/lerobot && \
+    pip install --no-cache-dir --no-deps -e .
+
+ENV PYTHONPATH="/app:/app/lerobot/src"
+
+# Copy conversion source
+COPY src/v3_conversion /app/v3_conversion
+COPY src/config.json /app/config.json
+COPY src/convert.sh /app/convert.sh
+RUN chmod +x /app/convert.sh
+
+# Import smoke test
+RUN python3 -c "\
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, CODEBASE_VERSION; \
+from v3_conversion.converter import run_conversion; \
+print(f'LeRobot {CODEBASE_VERSION} + v3_conversion OK') \
+"
+
+# ---- runtime ----
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libturbojpeg0 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Copy everything from builder
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /app /app
+
+ENV PYTHONPATH="/app:/app/lerobot/src"
+
+# Cleanup (preserve numpy tests — required by np.testing)
+RUN find /usr/local/lib/python3.12/site-packages \
+      -not -path "*/numpy/*" \
+      \( -type d -name "tests" -o \
+         -type d -name "test" \) \
+      -exec rm -rf {} + 2>/dev/null; \
+    find /usr/local/lib/python3.12/site-packages -name "__pycache__" -type d \
+      -exec rm -rf {} + 2>/dev/null; \
+    find /usr/local/lib/python3.12/site-packages -name "*.pyc" -delete 2>/dev/null; \
+    true
+
+CMD ["bash"]
