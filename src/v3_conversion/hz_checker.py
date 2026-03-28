@@ -4,27 +4,21 @@ Pure Python — no ROS2 or MCAP dependencies.
 validate_mcap_topics() has been moved to mcap_reader.py.
 """
 
+from dataclasses import dataclass, field
 from typing import Any
 
 NSEC_PER_SEC = 1_000_000_000.0
 
 
+@dataclass
 class HzValidationResult:
     """Validation result for entire MCAP file."""
 
-    def __init__(
-        self,
-        is_valid: bool,
-        overall_message: str,
-        topic_results: dict[str, dict[str, Any]] | None = None,
-        timing_source: str = "",
-        timing_source_valid: bool = True,
-    ):
-        self.is_valid = is_valid
-        self.overall_message = overall_message
-        self.topic_results = topic_results or {}
-        self.timing_source = timing_source
-        self.timing_source_valid = timing_source_valid
+    is_valid: bool = False
+    overall_message: str = ""
+    topic_results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    timing_source: str = ""
+    timing_source_valid: bool = True
 
     def format_diagnostic(self) -> str:
         """Format a human-readable diagnostic message."""

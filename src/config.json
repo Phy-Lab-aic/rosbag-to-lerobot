@@ -1,6 +1,27 @@
 {
-  "task": "Amore_v4_sunscreen",
-  "robot": "",
-  "fps": null,
-  "folders": "all"
+  "task": "aic_task",
+  "robot": "ur5e",
+  "fps": 20,
+  "folders": "all",
+
+  "camera_topic_map": {
+    "cam_left": "/left_camera/image",
+    "cam_center": "/center_camera/image",
+    "cam_right": "/right_camera/image"
+  },
+  "joint_names": [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+    "gripper/left_finger_joint"
+  ],
+  "state_topic": "/joint_states",
+  "action_topics_map": {
+    "leader": "/joint_states"
+  },
+  "task_instruction": [],
+  "tags": []
 }

@@ -7,7 +7,8 @@ the original dataset_manager.conversion.mcap_reader.
 
 from typing import Any, Dict, List, Tuple
 
-from mcap.reader import make_reader
+from mcap.reader import make_reader, NonSeekingReader, SeekingReader
+from mcap.stream_reader import StreamReader
 from mcap_ros2.decoder import DecoderFactory
 
 from v3_conversion.data_spec import Rosbag
@@ -23,16 +24,45 @@ HZ_MIN_RATIO = 0.7
 def _read_rosbag_messages(bag_path: str):
     """Yield ``(topic, msg, timestamp, schema_name)`` from an MCAP bag.
 
-    Uses mcap-ros2-support DecoderFactory for CDR deserialization.
-    schema_name comes from the MCAP channel's schema (e.g.,
-    ``"sensor_msgs/msg/CompressedImage"``).
+    Uses a forward-only StreamReader + DecoderFactory for CDR
+    deserialization.  Tolerates truncated MCAP files (missing footer)
+    by catching errors at the record level.
     """
-    decoder = DecoderFactory()
+    decoder_factory = DecoderFactory()
+    schemas: dict[int, Any] = {}
+    channels: dict[int, Any] = {}
+    decoders: dict[int, Any] = {}  # channel_id -> decoder fn
+
     with open(bag_path, "rb") as f:
-        reader = make_reader(f, decoder_factories=[decoder])
-        for schema, channel, message, decoded_msg in reader.iter_decoded_messages():
-            schema_name = schema.name if schema else ""
-            yield channel.topic, decoded_msg, message.log_time, schema_name
+        try:
+            for record in StreamReader(f, record_size_limit=None).records:
+                rtype = type(record).__name__
+                if rtype == "Schema":
+                    schemas[record.id] = record
+                elif rtype == "Channel":
+                    channels[record.id] = record
+                elif rtype == "Message":
+                    ch = channels.get(record.channel_id)
+                    if ch is None:
+                        continue
+                    sc = schemas.get(ch.schema_id)
+                    if sc is None:
+                        continue
+                    # Lazily build decoder per channel
+                    if record.channel_id not in decoders:
+                        decoders[record.channel_id] = decoder_factory.decoder_for(
+                            ch.message_encoding, sc
+                        )
+                    dec_fn = decoders[record.channel_id]
+                    if dec_fn is None:
+                        continue
+                    try:
+                        decoded_msg = dec_fn(record.data)
+                    except Exception:
+                        continue
+                    yield ch.topic, decoded_msg, record.log_time, sc.name
+        except Exception:
+            return  # stop gracefully at truncated region
 
 
 def _resolve_action_topics(
@@ -54,9 +84,25 @@ def _resolve_action_topics(
 
 
 _SIDE_ALIASES: dict[str, list[str]] = {
-    "left": ["left", "_l_", "_l"],
-    "right": ["right", "_r_", "_r"],
+    "left": ["left", "_l_"],
+    "right": ["right", "_r_"],
 }
+
+
+def _matches_side(name: str, patterns: list[str]) -> bool:
+    """Check if a joint name matches side patterns (word boundary aware)."""
+    lower = name.lower()
+    for p in patterns:
+        if p in ("left", "right"):
+            # Full word: must appear as a segment (e.g. "left_finger" but not "eleft")
+            if p in lower and (
+                lower.startswith(p) or lower.endswith(p)
+                or f"_{p}" in lower or f"{p}_" in lower
+            ):
+                return True
+        elif p in lower:
+            return True
+    return False
 
 
 def _build_action_joint_order(
@@ -74,7 +120,7 @@ def _build_action_joint_order(
             patterns = _SIDE_ALIASES.get(suffix, [suffix])
             action_joint_order[action_name] = [
                 name for name in joint_names
-                if any(p in name.lower() for p in patterns)
+                if _matches_side(name, patterns)
             ]
             continue
 
@@ -90,14 +136,36 @@ def _build_action_joint_order(
 def validate_mcap_topics(
     bag_path: str, topic_map: dict[str, str]
 ) -> dict[str, Any]:
-    """Validate that expected topics exist in MCAP file."""
+    """Validate that expected topics exist in MCAP file.
+
+    Tries summary-based read first (fast). Falls back to a forward scan
+    of channel records for truncated MCAP files that lack a valid footer.
+    """
     mcap_topics: list[str] = []
-    with open(bag_path, "rb") as f:
-        reader = make_reader(f)
-        summary = reader.get_summary()
-        if summary:
-            for channel in summary.channels.values():
-                mcap_topics.append(channel.topic)
+
+    # Try summary first (fast path)
+    try:
+        with open(bag_path, "rb") as f:
+            reader = SeekingReader(f, record_size_limit=None)
+            summary = reader.get_summary()
+            if summary:
+                for channel in summary.channels.values():
+                    mcap_topics.append(channel.topic)
+    except Exception:
+        mcap_topics = []
+
+    # Fallback: forward scan for truncated files without footer
+    if not mcap_topics:
+        from mcap.stream_reader import StreamReader
+        try:
+            with open(bag_path, "rb") as f:
+                seen = set()
+                for record in StreamReader(f, record_size_limit=None).records:
+                    if hasattr(record, "topic") and record.topic not in seen:
+                        seen.add(record.topic)
+                        mcap_topics.append(record.topic)
+        except Exception:
+            pass  # read as many channels as possible before corruption
 
     expected_topics = set(topic_map.keys())
     mcap_topics_set = set(mcap_topics)
@@ -125,8 +193,13 @@ def extract_frames(
     camera_names = config.camera_names
     fps = config.fps
 
+    shared_action_names = config.shared_action_names
+
     frames: List[Dict[str, Any]] = []
     timestamps: dict[str, list[int]] = {name: [] for name in topic_map.values()}
+    # Add timestamp tracking for shared actions (not in topic_map)
+    for sa in shared_action_names:
+        timestamps[sa] = []
 
     timegap = 1_000_000_000 // fps
     ts_ref = -timegap
@@ -137,6 +210,9 @@ def extract_frames(
     leader_msgs: dict = {}
     schema_map: dict[str, str] = {}
     msg_flag = {name: False for name in topic_map.values()}
+    # Add flags for shared actions
+    for sa in shared_action_names:
+        msg_flag[sa] = False
     cnt = 0
     timing = False
 
@@ -148,12 +224,36 @@ def extract_frames(
         timestamps[canonical_name].append(t)
         schema_map[canonical_name] = schema_name
 
+        # Timing gate: only the timing source controls frame pacing.
+        # When the timing source arrives too early, skip *only that message*
+        # (not the entire loop iteration) so other topics are still collected.
         if not timing and canonical_name == timing_source:
             if (t - ts_ref) < timegap:
                 continue
             ts_ref = t if ts_ref < 0 else ts_ref + timegap
             timing = True
+        elif not timing and canonical_name != timing_source:
+            # Non-timing-source messages: collect them but don't advance frame
+            if not msg_flag[canonical_name]:
+                if canonical_name.startswith("cam_"):
+                    image_msgs[canonical_name] = msg
+                elif canonical_name == "action" or canonical_name.startswith("action_"):
+                    leader_msgs[canonical_name] = msg
+                elif canonical_name == "observation":
+                    follower_msgs[canonical_name] = msg
+                    for sa in shared_action_names:
+                        if not msg_flag[sa]:
+                            leader_msgs[sa] = msg
+                            timestamps[sa].append(t)
+                            schema_map[sa] = schema_name
+                            msg_flag[sa] = True
+                            cnt += 1
+                msg_flag[canonical_name] = True
+                cnt += 1
+            continue
 
+        # Convention: camera keys must start with "cam_" in camera_topic_map.
+        # Other canonical names: "observation" (state), "action"/"action_*" (leader).
         if not msg_flag[canonical_name]:
             if canonical_name.startswith("cam_"):
                 image_msgs[canonical_name] = msg
@@ -161,6 +261,14 @@ def extract_frames(
                 leader_msgs[canonical_name] = msg
             elif canonical_name == "observation":
                 follower_msgs[canonical_name] = msg
+                # Auto-fill shared actions that use the same topic as state
+                for sa in shared_action_names:
+                    if not msg_flag[sa]:
+                        leader_msgs[sa] = msg
+                        timestamps[sa].append(t)
+                        schema_map[sa] = schema_name
+                        msg_flag[sa] = True
+                        cnt += 1
             msg_flag[canonical_name] = True
             cnt += 1
 
@@ -171,7 +279,8 @@ def extract_frames(
             image_msgs, follower_msgs, leader_msgs,
             joint_order, rot_img, schema_map,
         )
-        frames.append(frame)
+        if frame is not None:
+            frames.append(frame)
 
         for key in msg_flag:
             msg_flag[key] = False
@@ -201,8 +310,14 @@ def build_extraction_config(
     for cam_name, topic in camera_topic_map.items():
         topic_map[topic] = cam_name
     topic_map[state_topic] = "observation"
+
+    # Track action canonical names that share the same topic as state
+    shared_action_names: list[str] = []
     for action_topic, canonical in action_topic_to_canonical.items():
-        topic_map[action_topic] = canonical
+        if action_topic == state_topic:
+            shared_action_names.append(canonical)
+        else:
+            topic_map[action_topic] = canonical
     camera_names = sorted(camera_topic_map.keys())
 
     # 3. Determine action order and joint structure
@@ -227,4 +342,5 @@ def build_extraction_config(
         fps=fps,
         hz_min_ratio=HZ_MIN_RATIO,
         robot_type=robot_type,
+        shared_action_names=shared_action_names,
     )

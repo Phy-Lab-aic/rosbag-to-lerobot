@@ -33,11 +33,12 @@ RUN pip install --no-cache-dir \
 # lerobot (editable install, no-deps — transitive deps already installed above)
 COPY lerobot /app/lerobot
 RUN cd /app/lerobot && \
-    pip install --no-cache-dir --no-deps -e .
+    pip install --no-cache-dir --no-deps .
 
 ENV PYTHONPATH="/app:/app/lerobot/src"
 
 # Copy conversion source
+COPY src/main.py /app/main.py
 COPY src/v3_conversion /app/v3_conversion
 COPY src/config.json /app/config.json
 COPY src/convert.sh /app/convert.sh
@@ -45,7 +46,8 @@ RUN chmod +x /app/convert.sh
 
 # Import smoke test
 RUN python3 -c "\
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, CODEBASE_VERSION; \
+from lerobot.datasets.dataset_metadata import CODEBASE_VERSION; \
+from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
 from v3_conversion.converter import run_conversion; \
 print(f'LeRobot {CODEBASE_VERSION} + v3_conversion OK') \
 "

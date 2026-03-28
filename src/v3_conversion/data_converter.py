@@ -19,6 +19,8 @@ import numpy as np
 
 def _handle_joint_trajectory(msg_data, joint_order: List[str]) -> np.ndarray:
     """Handle trajectory_msgs/msg/JointTrajectory."""
+    if not msg_data.points:
+        raise ValueError("JointTrajectory has empty points list")
     joint_pos_map = dict(zip(msg_data.joint_names, msg_data.points[0].positions))
     ordered = [joint_pos_map[name] for name in joint_order]
     return np.array(ordered, dtype=np.float32)
@@ -35,22 +37,42 @@ def _handle_joint_state(msg_data, joint_order: List[str]) -> np.ndarray:
 
 
 def _handle_odometry(msg_data, joint_order: List[str]) -> np.ndarray:
-    """Handle nav_msgs/msg/Odometry."""
+    """Handle nav_msgs/msg/Odometry.
+
+    Extracts [linear.x, linear.y, angular.z].  ``joint_order`` is accepted
+    for interface consistency but not used for field selection.
+    """
     linear = np.array(
         [msg_data.twist.twist.linear.x, msg_data.twist.twist.linear.y],
         dtype=np.float32,
     )
     angular = np.array([msg_data.twist.twist.angular.z], dtype=np.float32)
-    return np.concatenate((linear, angular))
+    result = np.concatenate((linear, angular))
+    if joint_order and len(joint_order) != len(result):
+        raise ValueError(
+            f"Odometry produces {len(result)} values but joint_order "
+            f"expects {len(joint_order)}: {joint_order}"
+        )
+    return result
 
 
 def _handle_twist(msg_data, joint_order: List[str]) -> np.ndarray:
-    """Handle geometry_msgs/msg/Twist."""
+    """Handle geometry_msgs/msg/Twist.
+
+    Extracts [linear.x, linear.y, angular.z].  ``joint_order`` is accepted
+    for interface consistency but not used for field selection.
+    """
     linear = np.array(
         [msg_data.linear.x, msg_data.linear.y], dtype=np.float32
     )
     angular = np.array([msg_data.angular.z], dtype=np.float32)
-    return np.concatenate((linear, angular))
+    result = np.concatenate((linear, angular))
+    if joint_order and len(joint_order) != len(result):
+        raise ValueError(
+            f"Twist produces {len(result)} values but joint_order "
+            f"expects {len(joint_order)}: {joint_order}"
+        )
+    return result
 
 
 _JOINT_HANDLERS = {
@@ -65,18 +87,10 @@ _JOINT_HANDLERS = {
 # Private helpers
 # ------------------------------------------------------------------
 
-def _compressed_image2cvmat(
-    msg: Any, desired_encoding: str = "passthrough"
-) -> np.ndarray:
-    """Deserialized CompressedImage -> numpy BGR/RGB array."""
+def _compressed_image2cvmat(msg: Any) -> np.ndarray:
+    """Deserialized CompressedImage -> numpy BGR array."""
     buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-
-    if desired_encoding in ("passthrough", "raw"):
-        flag = cv2.IMREAD_UNCHANGED
-    else:
-        flag = cv2.IMREAD_COLOR
-
-    img = cv2.imdecode(buf, flag)
+    img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise RuntimeError(
             f"cv2.imdecode failed (format={getattr(msg, 'format', None)})"
@@ -85,11 +99,70 @@ def _compressed_image2cvmat(
     if img.dtype == np.uint16:
         img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
 
-    if desired_encoding.lower() in ("rgb8", "rgb"):
-        if img.ndim == 3 and img.shape[2] == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # Ensure 3-channel BGR output
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.ndim == 3 and img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
     return img
+
+
+# Encoding -> number of channels for raw Image messages
+_RAW_ENCODING_CHANNELS = {
+    "rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4,
+    "mono8": 1, "mono16": 1,
+    "8UC1": 1, "8UC3": 3, "8UC4": 4,
+    "16UC1": 1, "16UC3": 3, "32FC1": 1,
+}
+
+
+def _raw_image2cvmat(msg: Any) -> np.ndarray:
+    """Deserialized sensor_msgs/Image -> numpy BGR array."""
+    encoding = getattr(msg, "encoding", "bgr8")
+    height = msg.height
+    width = msg.width
+    channels = _RAW_ENCODING_CHANNELS.get(encoding)
+    if channels is None:
+        raise ValueError(
+            f"Unsupported raw image encoding: '{encoding}'. "
+            f"Supported: {list(_RAW_ENCODING_CHANNELS.keys())}"
+        )
+
+    dtype = np.uint8
+    if "32F" in encoding:
+        dtype = np.float32
+    elif "16" in encoding:
+        dtype = np.uint16
+
+    buf = np.frombuffer(bytes(msg.data), dtype=dtype)
+    if channels == 1:
+        img = buf.reshape(height, width)
+    else:
+        img = buf.reshape(height, width, channels)
+
+    # Normalize to 8-bit BGR
+    if dtype == np.uint16:
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+
+    if encoding in ("rgb8",):
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    elif encoding in ("rgba8",):
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    elif encoding in ("bgra8",):
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    elif channels == 1:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    return img
+
+
+def _decode_image(msg: Any, schema_name: str) -> np.ndarray:
+    """Dispatch image decoding based on schema name. Returns BGR array."""
+    if "CompressedImage" in schema_name:
+        return _compressed_image2cvmat(msg)
+    else:
+        return _raw_image2cvmat(msg)
 
 
 def _convert_joint_msg(
@@ -129,21 +202,23 @@ def build_frame(
         Maps canonical name -> MCAP schema name (e.g.,
         ``"observation" -> "sensor_msgs/msg/JointState"``).
     """
-    # -- images --
+    # -- images (schema-based dispatch: raw Image or CompressedImage) --
     camera_data = {}
     for key, value in (image_msgs or {}).items():
+        img_schema = schema_map.get(key, "")
         camera_data[key] = cv2.cvtColor(
-            _compressed_image2cvmat(value), cv2.COLOR_BGR2RGB
+            _decode_image(value, img_schema), cv2.COLOR_BGR2RGB
         )
 
     # -- observation (follower) --
-    follower_data: list = []
+    follower_arrays: list = []
     for canon_name, value in (follower_msgs or {}).items():
         if value is not None:
             obs_schema = schema_map.get(canon_name, "")
-            follower_data.extend(
+            follower_arrays.append(
                 _convert_joint_msg(value, joint_order["obs"], obs_schema)
             )
+    follower_data = np.concatenate(follower_arrays) if follower_arrays else np.array([], dtype=np.float32)
 
     # -- action (leader) --
     leader_joint_order = joint_order.get("action")

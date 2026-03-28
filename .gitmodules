@@ -1,4 +1,3 @@
 [submodule "lerobot"]
 	path = lerobot
-	url = https://github.com/Tommoro-AI/lerobot_tommoro.git
-	branch = release
+	url = https://github.com/huggingface/lerobot.git

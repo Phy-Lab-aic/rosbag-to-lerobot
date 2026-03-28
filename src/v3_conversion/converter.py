@@ -28,7 +28,11 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 
 def _load_config(config_path: str) -> dict:
-    """Load and validate JSON config file."""
+    """Load and validate JSON config file.
+
+    Config-level fields (camera_topic_map, joint_names, state_topic,
+    action_topics_map) serve as defaults when metacard.json is absent.
+    """
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
@@ -38,14 +42,18 @@ def _load_config(config_path: str) -> dict:
 
     folders = config.get("folders", [])
     if folders == "all":
-        # Scan INPUT_PATH for all subdirectories
+        # Scan INPUT_PATH for all subdirectories containing .mcap files
         if INPUT_PATH.is_dir():
             folders = sorted([
                 d.name for d in INPUT_PATH.iterdir()
-                if d.is_dir() and (d / "metacard.json").is_file()
+                if d.is_dir() and any(d.glob("*.mcap"))
             ])
         else:
             folders = []
+    elif not isinstance(folders, list):
+        raise ValueError(
+            f"'folders' must be a list of folder names or 'all', got: {type(folders).__name__}"
+        )
 
     robot_type = config.get("robot") or config.get("robot_type") or ""
     fps = config.get("fps", None)
@@ -55,6 +63,13 @@ def _load_config(config_path: str) -> dict:
         "folders": folders,
         "robot_type": robot_type,
         "fps": fps,
+        # Config-level defaults used when metacard.json is missing
+        "camera_topic_map": config.get("camera_topic_map", {}),
+        "joint_names": config.get("joint_names", []),
+        "state_topic": config.get("state_topic", ""),
+        "action_topics_map": config.get("action_topics_map", {}),
+        "task_instruction": config.get("task_instruction", []),
+        "tags": config.get("tags", []),
     }
 
 
@@ -62,30 +77,44 @@ def _load_config(config_path: str) -> dict:
 # Metacard loading
 # ------------------------------------------------------------------
 
-def _load_metacard(folder_name: str) -> Dict[str, Any]:
-    """Load and parse metacard.json from a raw folder."""
+def _load_metacard(
+    folder_name: str,
+    config_defaults: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Load and parse metacard.json from a raw folder.
+
+    When metacard.json is absent, falls back to *config_defaults* (the
+    config-level topic/joint fields).  Any field present in the metacard
+    takes precedence over the config default.
+    """
+    defaults = config_defaults or {}
     metacard_path = INPUT_PATH / folder_name / "metacard.json"
-    if not metacard_path.is_file():
-        raise FileNotFoundError(f"metacard.json not found: {metacard_path}")
 
-    with metacard_path.open("r", encoding="utf-8") as f:
-        metacard = json.load(f)
+    if metacard_path.is_file():
+        with metacard_path.open("r", encoding="utf-8") as f:
+            metacard = json.load(f)
+    else:
+        logger.info(
+            "  metacard.json not found for '%s', using config defaults",
+            folder_name,
+        )
+        metacard = {}
 
-    ti = metacard.get("task_instruction", [])
+    ti = metacard.get("task_instruction", defaults.get("task_instruction", []))
     if not isinstance(ti, list):
         ti = [str(ti)] if ti else []
 
     return {
         "folder_dir": folder_name,
-        "fps": int(metacard.get("fps", 30)),
-        "robot_type": str(metacard.get("robot_type", "")),
+        "fps": int(metacard.get("fps", defaults.get("fps") or 30)),
+        "robot_type": str(metacard.get("robot_type", defaults.get("robot_type", ""))),
         "task_instruction": ti,
-        "tags": metacard.get("tags", []),
-        "camera_topic_map": metacard.get("camera_topic_map", {}),
-        "joint_topic_map": metacard.get("joint_topic_map", {}),
-        "joint_names": metacard.get("joint_names", []),
-        "action_topics_map": metacard.get("action_topics_map"),
-        "state_topic": metacard.get("state_topic"),
+        "tags": metacard.get("tags", defaults.get("tags", [])),
+        "camera_topic_map": metacard.get("camera_topic_map", defaults.get("camera_topic_map", {})),
+        "joint_topic_map": metacard.get("joint_topic_map", defaults.get("joint_topic_map", {})),
+        "joint_names": metacard.get("joint_names", defaults.get("joint_names", [])),
+        "action_topics_map": metacard.get("action_topics_map", defaults.get("action_topics_map", {})),
+        "state_topic": metacard.get("state_topic", defaults.get("state_topic", "")),
     }
 
 
@@ -93,45 +122,66 @@ def _load_metacard(folder_name: str) -> Dict[str, Any]:
 # Config validation (ported from conversion_node.py:479-536)
 # ------------------------------------------------------------------
 
+def _find_mcap(folder_name: str) -> Path:
+    """Locate the MCAP file inside a raw folder.
+
+    Tries ``<folder>/<folder>_0.mcap`` first, then falls back to the
+    first ``*.mcap`` found in the directory.
+    """
+    canonical = INPUT_PATH / folder_name / f"{folder_name}_0.mcap"
+    if canonical.is_file():
+        return canonical
+
+    folder_dir = INPUT_PATH / folder_name
+    mcaps = sorted(folder_dir.glob("*.mcap"))
+    if mcaps:
+        return mcaps[0]
+
+    raise FileNotFoundError(f"No MCAP file found in {folder_dir}")
+
+
 def _prepare_config(
     folder_name: str,
     metadata: Dict[str, Any],
     robot_type_override: str = "",
     fps_override: Optional[int] = None,
 ):
-    """Validate metacard and build extraction config.
+    """Validate metadata and build extraction config.
 
-    Ported from ConversionNode._prepare_config() with identical validation.
+    Required fields: camera_topic_map, joint_names, action_topics_map,
+    state_topic.  When any of these are empty the folder is skipped.
     """
-    mcap_path = INPUT_PATH / folder_name / f"{folder_name}_0.mcap"
-    if not mcap_path.is_file():
-        raise FileNotFoundError(f"MCAP file not found: {mcap_path}")
+    mcap_path = _find_mcap(folder_name)
 
     camera_topic_map = metadata.get("camera_topic_map")
     if not isinstance(camera_topic_map, dict) or not camera_topic_map:
         raise ValueError(
-            f"Invalid camera_topic_map in metacard [folder={folder_name}]"
+            f"camera_topic_map is empty or missing [folder={folder_name}]. "
+            "Provide it in metacard.json or config.json."
         )
 
     joint_names = metadata.get("joint_names")
     if not isinstance(joint_names, list) or not joint_names:
         raise ValueError(
-            f"Invalid joint_names in metacard [folder={folder_name}]"
+            f"joint_names is empty or missing [folder={folder_name}]. "
+            "Provide it in metacard.json or config.json."
         )
 
     action_topics_map = metadata.get("action_topics_map")
     if not isinstance(action_topics_map, dict) or not action_topics_map:
         raise ValueError(
-            f"Invalid action_topics_map in metacard [folder={folder_name}]"
+            f"action_topics_map is empty or missing [folder={folder_name}]. "
+            "Provide it in metacard.json or config.json."
         )
 
     state_topic = metadata.get("state_topic")
     if not isinstance(state_topic, str) or not state_topic.strip():
         raise ValueError(
-            f"Invalid state_topic in metacard [folder={folder_name}]"
+            f"state_topic is empty or missing [folder={folder_name}]. "
+            "Provide it in metacard.json or config.json."
         )
 
-    fps = fps_override if fps_override else int(metadata.get("fps", 30))
+    fps = fps_override if fps_override is not None else int(metadata.get("fps", 30))
     robot_type = robot_type_override if robot_type_override else str(metadata.get("robot_type", "")).strip()
 
     config = build_extraction_config(
@@ -170,6 +220,18 @@ def run_conversion(config_path: str) -> int:
     robot_type = cfg["robot_type"]
     fps_override = cfg["fps"]
 
+    # Config-level defaults for metacard fallback
+    config_defaults = {
+        "robot_type": robot_type,
+        "fps": fps_override,
+        "camera_topic_map": cfg.get("camera_topic_map", {}),
+        "joint_names": cfg.get("joint_names", []),
+        "state_topic": cfg.get("state_topic", ""),
+        "action_topics_map": cfg.get("action_topics_map", {}),
+        "task_instruction": cfg.get("task_instruction", []),
+        "tags": cfg.get("tags", []),
+    }
+
     if not folders:
         logger.error("No folders to convert")
         return 1
@@ -186,8 +248,8 @@ def run_conversion(config_path: str) -> int:
         logger.info("[%d/%d] Converting: %s", idx + 1, len(folders), folder_name)
 
         try:
-            # 1. Load metacard
-            metadata = _load_metacard(folder_name)
+            # 1. Load metacard (falls back to config defaults)
+            metadata = _load_metacard(folder_name, config_defaults)
 
             # 2. Validate and build config
             mcap_path, config = _prepare_config(
@@ -235,8 +297,10 @@ def run_conversion(config_path: str) -> int:
 
             if not frames:
                 raise ValueError(
-                    f"No frames extracted [folder={folder_name}] from {mcap_path} "
-                    f"- all expected topics present but check timing/sync"
+                    f"No frames extracted [folder={folder_name}] from {mcap_path}. "
+                    f"All expected topics present but build_frame() returned None "
+                    f"for every cycle — likely cause: incomplete action data "
+                    f"(missing leader topics or action key mismatch)."
                 )
 
             # 7. Transform to episode (with task_instruction extraction)
@@ -270,7 +334,7 @@ def run_conversion(config_path: str) -> int:
             # Error recovery: reload dataset state so next folder can proceed
             if creator is not None:
                 try:
-                    creator._recover_dataset_state()
+                    creator.recover_dataset_state()
                 except Exception as recover_err:
                     logger.error("  Recovery failed: %s", recover_err)
                     creator.dataset = None

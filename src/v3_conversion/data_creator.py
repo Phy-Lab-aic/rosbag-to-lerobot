@@ -13,7 +13,7 @@ import av
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION as version
+from lerobot.datasets.dataset_metadata import CODEBASE_VERSION as version
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 logger = logging.getLogger(__name__)
@@ -104,7 +104,20 @@ class DataCreator:
 
         dataset_root = Path(self.root)
         if dataset_root.exists():
-            shutil.rmtree(dataset_root)
+            # Safety: only remove if it looks like a LeRobot dataset or is empty
+            meta_info = dataset_root / "meta" / "info.json"
+            is_lerobot_dataset = meta_info.is_file()
+            is_empty = not any(dataset_root.iterdir())
+            if is_lerobot_dataset or is_empty:
+                logger.warning(
+                    "Removing existing dataset directory: %s", dataset_root
+                )
+                shutil.rmtree(dataset_root)
+            else:
+                raise RuntimeError(
+                    f"Directory exists but is not a LeRobot dataset: {dataset_root}. "
+                    "Remove it manually or choose a different output path."
+                )
         dataset_root.parent.mkdir(parents=True, exist_ok=True)
 
         self.dataset = LeRobotDataset.create(
@@ -170,10 +183,19 @@ class DataCreator:
         else:
             self._episode_custom_metadata.append({})
 
-    def _recover_dataset_state(self) -> None:
-        """Close writers and reload dataset from disk after failed episode."""
+    def recover_dataset_state(self) -> None:
+        """Close writers and reload dataset from disk after failed episode.
+
+        Uses LeRobot internal APIs (image_writer, _close_writer) that may
+        change across versions.  Pin your lerobot dependency accordingly.
+        """
         if not self.dataset:
             return
+        try:
+            if hasattr(self.dataset, "image_writer") and self.dataset.image_writer is not None:
+                self.dataset.image_writer.stop()
+        except Exception as e:
+            logger.debug("Failed to stop image writer during recovery: %s", e)
         try:
             self.dataset._close_writer()
         except Exception:
@@ -210,31 +232,31 @@ class DataCreator:
         meta = self.dataset.meta
         root = Path(self.dataset.root)
 
-        from lerobot.datasets.utils import load_episodes
+        from lerobot.datasets.io_utils import load_episodes
         episodes = load_episodes(root)
 
-        vid_key = meta.video_keys[0]
+        primary_vid_key = meta.video_keys[0]
 
-        # Group episodes by video file
+        # Group episodes by video file (using primary camera)
         video_groups: Dict[tuple, list] = {}
         for ep_idx in range(len(episodes)):
             ep = episodes[ep_idx]
-            chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
-            file_idx = ep[f"videos/{vid_key}/file_index"]
+            chunk_idx = ep[f"videos/{primary_vid_key}/chunk_index"]
+            file_idx = ep[f"videos/{primary_vid_key}/file_index"]
             vf_key = (chunk_idx, file_idx)
             if vf_key not in video_groups:
                 video_groups[vf_key] = []
             video_groups[vf_key].append({
                 "episode_index": ep["episode_index"],
-                "from_ts": ep[f"videos/{vid_key}/from_timestamp"],
-                "to_ts": ep[f"videos/{vid_key}/to_timestamp"],
+                "from_ts": ep[f"videos/{primary_vid_key}/from_timestamp"],
+                "to_ts": ep[f"videos/{primary_vid_key}/to_timestamp"],
             })
 
         # Read actual PTS from each video file and compute per-episode corrections
         corrections: Dict[int, List[float]] = {}
         for (chunk_idx, file_idx), ep_infos in video_groups.items():
             video_path = root / meta.video_path.format(
-                video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx,
+                video_key=primary_vid_key, chunk_index=chunk_idx, file_index=file_idx,
             )
             if not video_path.is_file():
                 logger.warning("Video file not found, skipping correction: %s", video_path)
@@ -260,6 +282,57 @@ class DataCreator:
 
         if not corrections:
             return
+
+        # Verify PTS consistency across all cameras (cache decoded PTS per file)
+        _pts_cache: Dict[str, List[float]] = {}
+        for other_vid_key in meta.video_keys[1:]:
+            for (chunk_idx, file_idx), ep_infos in video_groups.items():
+                other_path = root / meta.video_path.format(
+                    video_key=other_vid_key, chunk_index=chunk_idx, file_index=file_idx,
+                )
+                if not other_path.is_file():
+                    continue
+
+                cache_key = str(other_path)
+                if cache_key in _pts_cache:
+                    other_pts = _pts_cache[cache_key]
+                else:
+                    other_pts = []
+                    with av.open(str(other_path)) as container:
+                        stream = container.streams.video[0]
+                        for frame in container.decode(stream):
+                            other_pts.append(float(frame.pts * frame.time_base))
+                    _pts_cache[cache_key] = other_pts
+
+                for info in ep_infos:
+                    ep_idx = info["episode_index"]
+                    if ep_idx not in corrections:
+                        continue
+                    from_ts = info["from_ts"]
+                    to_ts = info["to_ts"]
+                    other_ep_pts = sorted([
+                        pts - from_ts for pts in other_pts
+                        if from_ts - 1e-6 <= pts < to_ts + 1e-6
+                    ])
+                    primary_pts = corrections[ep_idx]
+                    if len(other_ep_pts) != len(primary_pts):
+                        logger.warning(
+                            "PTS frame count mismatch: %s has %d frames, %s has %d "
+                            "(episode %d). Timestamps corrected using %s only.",
+                            primary_vid_key, len(primary_pts),
+                            other_vid_key, len(other_ep_pts), ep_idx,
+                            primary_vid_key,
+                        )
+                    elif any(
+                        abs(a - b) > 1e-3
+                        for a, b in zip(primary_pts, other_ep_pts)
+                    ):
+                        logger.warning(
+                            "PTS drift detected between %s and %s "
+                            "(episode %d, >1ms). Timestamps corrected using %s.",
+                            primary_vid_key, other_vid_key, ep_idx,
+                            primary_vid_key,
+                        )
 
         # Group episodes by data parquet file
         data_groups: Dict[tuple, List[int]] = {}
