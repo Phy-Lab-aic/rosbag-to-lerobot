@@ -1,5 +1,6 @@
 {
   "task": "aic_task",
+  "repo_id": "psedulab/aic_task",
   "robot": "ur5e",
   "fps": 20,
   "folders": "all",

@@ -40,6 +40,9 @@ def _load_config(config_path: str) -> dict:
     if not task_name:
         raise ValueError("Config must have 'task' or 'task_name'")
 
+    # repo_id for HuggingFace Hub (must be "namespace/dataset-name" format)
+    repo_id = config.get("repo_id", "")
+
     folders = config.get("folders", [])
     if folders == "all":
         # Scan INPUT_PATH for all subdirectories containing .mcap files
@@ -60,6 +63,7 @@ def _load_config(config_path: str) -> dict:
 
     return {
         "task_name": task_name,
+        "repo_id": repo_id,
         "folders": folders,
         "robot_type": robot_type,
         "fps": fps,
@@ -216,6 +220,7 @@ def run_conversion(config_path: str) -> int:
     """
     cfg = _load_config(config_path)
     task_name = cfg["task_name"]
+    repo_id = cfg["repo_id"] or task_name
     folders = cfg["folders"]
     robot_type = cfg["robot_type"]
     fps_override = cfg["fps"]
@@ -259,7 +264,7 @@ def run_conversion(config_path: str) -> int:
             # 3. Initialize DataCreator on first successful config
             if creator is None:
                 creator = DataCreator(
-                    repo_id=task_name,
+                    repo_id=repo_id,
                     root=output_root,
                     robot_type=config.robot_type,
                     action_order=config.action_order,
@@ -350,6 +355,23 @@ def run_conversion(config_path: str) -> int:
             logger.info("Episode custom metadata patched")
         except Exception as e:
             logger.error("Failed to finalize dataset: %s", e)
+
+        # Push to HuggingFace Hub if repo_id has namespace format
+        if "/" in repo_id:
+            try:
+                from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+                ds = LeRobotDataset(repo_id=repo_id, root=output_root)
+                ds.push_to_hub(tags=cfg.get("tags") or None, push_videos=True)
+                logger.info("Pushed dataset to HuggingFace Hub: %s", repo_id)
+            except Exception as e:
+                logger.error("Failed to push to Hub: %s", e)
+        else:
+            logger.warning(
+                "Skipping push_to_hub: repo_id '%s' is not in 'namespace/name' format. "
+                "Set 'repo_id' in config.json (e.g. 'myuser/mydataset') to enable upload.",
+                repo_id,
+            )
 
     # Summary
     logger.info(

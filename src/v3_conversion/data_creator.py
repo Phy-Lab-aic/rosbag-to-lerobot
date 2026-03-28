@@ -99,7 +99,7 @@ class DataCreator:
                 features[f"observation.images.{cam_name}"] = {
                     "dtype": "video",
                     "shape": (h, w, c),
-                    "names": ["height", "width", "channel"],
+                    "names": ["height", "width", "channels"],
                 }
 
         dataset_root = Path(self.root)
