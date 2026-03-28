@@ -30,7 +30,7 @@ rosbag-to-lerobot/
 ## Clone
 
 ```bash
-git clone --recurse-submodules https://github.com/Tommoro-AI/rosbag-to-lerobot.git
+git clone https://github.com/Tommoro-AI/rosbag-to-lerobot.git --recursive
 cd rosbag-to-lerobot
 ```
 
