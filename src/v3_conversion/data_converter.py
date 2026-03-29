@@ -75,11 +75,29 @@ def _handle_twist(msg_data, joint_order: List[str]) -> np.ndarray:
     return result
 
 
+def _handle_controller_state(msg_data, joint_order: List[str]) -> np.ndarray:
+    """Handle aic_control_interfaces/msg/ControllerState.
+
+    Extracts joint positions from the ``reference_joint_state`` field
+    (trajectory_msgs/JointTrajectoryPoint).  Since JointTrajectoryPoint
+    carries no joint names, positions are returned in their original order
+    and ``joint_order`` is used only for length validation.
+    """
+    positions = list(msg_data.reference_joint_state.positions)
+    if joint_order and len(positions) != len(joint_order):
+        raise ValueError(
+            f"ControllerState.reference_joint_state has {len(positions)} "
+            f"positions but joint_order expects {len(joint_order)}"
+        )
+    return np.array(positions, dtype=np.float32)
+
+
 _JOINT_HANDLERS = {
     "trajectory_msgs/msg/JointTrajectory": _handle_joint_trajectory,
     "sensor_msgs/msg/JointState": _handle_joint_state,
     "nav_msgs/msg/Odometry": _handle_odometry,
     "geometry_msgs/msg/Twist": _handle_twist,
+    "aic_control_interfaces/msg/ControllerState": _handle_controller_state,
 }
 
 

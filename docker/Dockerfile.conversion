@@ -48,7 +48,7 @@ RUN chmod +x /app/convert.sh
 RUN python3 -c "\
 from lerobot.datasets.dataset_metadata import CODEBASE_VERSION; \
 from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
-from v3_conversion.converter import run_conversion; \
+from main import run_conversion; \
 print(f'LeRobot {CODEBASE_VERSION} + v3_conversion OK') \
 "
 

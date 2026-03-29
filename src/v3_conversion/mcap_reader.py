@@ -324,8 +324,11 @@ def build_extraction_config(
     all_action_names = sorted(set(action_topic_to_canonical.values()))
     left = [n for n in all_action_names if "left" in n.lower() and "right" not in n.lower()]
     right = [n for n in all_action_names if "right" in n.lower() and "left" not in n.lower()]
-    others = [n for n in all_action_names if n not in left and n not in right]
-    action_order = left + right + sorted(others)
+    if left and right:
+        others = [n for n in all_action_names if n not in left and n not in right]
+        action_order = left + right + sorted(others)
+    else:
+        action_order = all_action_names
 
     action_joint_order = _build_action_joint_order(action_order, joint_names)
 
