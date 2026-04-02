@@ -1,6 +1,6 @@
 {
   "task": "aic_task",
-  "repo_id": "psedulab/aic_task",
+  "repo_id": "Phy-lab/hojun",
   "robot": "ur5e",
   "fps": 20,
   "folders": "all",
@@ -16,13 +16,13 @@
     "elbow_joint",
     "wrist_1_joint",
     "wrist_2_joint",
-    "wrist_3_joint",
-    "gripper/left_finger_joint"
+    "wrist_3_joint"
   ],
   "state_topic": "/joint_states",
   "action_topics_map": {
     "leader": "/joint_states"
   },
+  "append": true,
   "task_instruction": [],
   "tags": []
 }

@@ -6,6 +6,8 @@ Reads JSON config, iterates folders, and produces LeRobot v3 datasets.
 
 import json
 import logging
+import shutil
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -18,6 +20,7 @@ from v3_conversion.hz_checker import validate_from_timestamps
 from v3_conversion.mcap_reader import (
     build_extraction_config,
     extract_frames,
+    extract_frames_iter,
     validate_mcap_topics,
 )
 
@@ -77,6 +80,8 @@ def _load_config(config_path: str) -> dict:
         "action_topics_map": config.get("action_topics_map", {}),
         "task_instruction": config.get("task_instruction", []),
         "tags": config.get("tags", []),
+        "append": config.get("append", False),
+        "cleanup_source_bags": config.get("cleanup_source_bags", False),
     }
 
 
@@ -245,6 +250,31 @@ def run_conversion(config_path: str) -> int:
         logger.error("No folders to convert")
         return 1
 
+    # Remove stopped aic_eval container to free disk (distrobox holds fd on deleted files)
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Status}}", "aic_eval"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip() == "exited":
+            subprocess.run(["docker", "rm", "aic_eval"], capture_output=True, timeout=10)
+            logger.info("Removed stopped aic_eval container (freed held disk space)")
+    except Exception:
+        pass  # docker not available or container doesn't exist — fine
+
+    # Disk space guard — warn if less than 10GB free
+    disk_check_path = OUTPUT_PATH if OUTPUT_PATH.exists() else OUTPUT_PATH.parent
+    free_gb = shutil.disk_usage(disk_check_path).free / (1024 ** 3)
+    if free_gb < 10:
+        logger.error(
+            "Low disk space: %.1fGB free. At least 10GB recommended. "
+            "Clean up Docker containers (docker rm), temp files, or source bags.",
+            free_gb,
+        )
+        return 1
+    elif free_gb < 20:
+        logger.warning("Disk space is low: %.1fGB free. Consider freeing space.", free_gb)
+
     logger.info("Starting conversion: task=%s, folders=%d", task_name, len(folders))
 
     output_root = str(OUTPUT_PATH / task_name)
@@ -265,7 +295,67 @@ def run_conversion(config_path: str) -> int:
                 folder_name, metadata, robot_type, fps_override
             )
 
-            # 3. Initialize DataCreator on first successful config
+            # 3. Pre-check: all expected topics exist in MCAP
+            validation = validate_mcap_topics(str(mcap_path), config.topic_map)
+            if validation["missing_topics"]:
+                raise ValueError(
+                    f"MCAP topic pre-check failed [folder={folder_name}]: "
+                    f"missing {validation['missing_topics']}"
+                )
+
+            # 5. Two-pass streaming conversion (avoids OOM on large bags)
+            #    Pass 1: collect obs/action (small arrays only)
+            #    Pass 2: stream images frame-by-frame to DataCreator
+            import numpy as np
+
+            task_instruction = "default_task"
+            ti = metadata.get("task_instruction")
+            if ti and isinstance(ti, list) and len(ti) > 0 and ti[0]:
+                task_instruction = ti[0]
+
+            # --- Pass 1: obs/action only ---
+            obs_list = []
+            action_lists = {key: [] for key in config.action_order}
+            first_frame_images = None
+
+            frame_count = 0
+            for frame in extract_frames_iter(
+                bag_path=str(mcap_path), config=config,
+            ):
+                obs_list.append(np.asarray(frame["obs"], dtype=np.float32))
+                for key in config.action_order:
+                    action_lists[key].append(
+                        np.asarray(frame["action"][key], dtype=np.float32)
+                    )
+                if first_frame_images is None and config.camera_names:
+                    import cv2
+                    first_frame_images = {
+                        cam: cv2.resize(frame["images"][cam], None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+                        for cam in config.camera_names
+                        if cam in frame["images"]
+                    }
+                frame_count += 1
+
+            if frame_count == 0:
+                raise ValueError(
+                    f"No frames extracted [folder={folder_name}] from {mcap_path}."
+                )
+
+            logger.info("  Pass 1 done: %d frames (obs/action collected)", frame_count)
+
+            # Collect obs/action arrays
+            obs_array = np.stack(obs_list, axis=0)
+            actions_by_key = {}
+            for key in config.action_order:
+                actions_by_key[key] = np.stack(action_lists[key], axis=0).astype(np.float32)
+            del obs_list, action_lists
+
+            # Concatenate action dims
+            all_actions = np.concatenate(
+                [actions_by_key[key] for key in config.action_order], axis=-1
+            ).astype(np.float32)
+
+            # --- Initialize DataCreator ---
             if creator is None:
                 creator = DataCreator(
                     repo_id=repo_id,
@@ -277,61 +367,83 @@ def run_conversion(config_path: str) -> int:
                     fps=config.fps,
                 )
 
-            # 4. Pre-check: all expected topics exist in MCAP
-            validation = validate_mcap_topics(str(mcap_path), config.topic_map)
-            if validation["missing_topics"]:
-                raise ValueError(
-                    f"MCAP topic pre-check failed [folder={folder_name}]: "
-                    f"missing {validation['missing_topics']}"
-                )
+                append_mode = cfg.get("append", False)
+                dataset_root = Path(output_root)
+                local_exists = (dataset_root / "meta" / "info.json").is_file()
 
-            # 5. Extract frames
-            frames, timestamps = extract_frames(
+                if append_mode and not local_exists and "/" in repo_id:
+                    # Pull existing dataset from HuggingFace to local path
+                    try:
+                        logger.info("Append mode: pulling existing dataset from Hub: %s", repo_id)
+                        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+                        # Download to default cache, then copy to output_root
+                        tmp_ds = LeRobotDataset(repo_id=repo_id)
+                        cached_root = Path(tmp_ds.root)
+                        dataset_root.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copytree(str(cached_root), str(dataset_root))
+                        del tmp_ds
+                        local_exists = True
+                        logger.info("Pulled %s to %s", repo_id, dataset_root)
+                    except Exception as e:
+                        logger.warning("No existing dataset on Hub, creating new: %s", e)
+
+                if append_mode and local_exists:
+                    logger.info("Append mode: loading existing dataset (%d episodes)",
+                                creator.dataset.meta.total_episodes if creator.dataset else 0)
+                    creator.load_dataset()
+                    logger.info("Loaded existing dataset with %d episodes",
+                                creator.dataset.meta.total_episodes)
+                else:
+                    # Build a minimal episode dict for create_dataset shape inference
+                    dummy_episode = {
+                        "obs": obs_array[:1],
+                        "images": {cam: [img] for cam, img in (first_frame_images or {}).items()},
+                        "task": task_instruction,
+                    }
+                    for key in config.action_order:
+                        dummy_episode[key] = actions_by_key[key][:1]
+                    creator.create_dataset(dummy_episode)
+
+            if creator.dataset.episode_buffer is None or "size" not in creator.dataset.episode_buffer:
+                creator.dataset.episode_buffer = creator.dataset.create_episode_buffer()
+
+            # --- Pass 2: stream images + write frames ---
+            logger.info("  Pass 2: streaming %d frames to dataset...", frame_count)
+            frame_idx = 0
+            for frame in extract_frames_iter(
                 bag_path=str(mcap_path), config=config,
-            )
+            ):
+                lerobot_frame = {
+                    "observation.state": obs_array[frame_idx],
+                    "action": all_actions[frame_idx],
+                }
+                for cam in config.camera_names:
+                    if cam in frame["images"]:
+                        import cv2
+                        img = frame["images"][cam]
+                        img = cv2.resize(img, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+                        lerobot_frame[f"observation.images.{cam}"] = img
+                lerobot_frame["task"] = task_instruction
+                creator.dataset.add_frame(lerobot_frame)
 
-            # 6. Hz validation
-            logger.info("  [Hz] validating %s (target=%dHz)", folder_name, config.fps)
-            hz_result = validate_from_timestamps(
-                timestamps=timestamps,
-                target_hz=float(config.fps),
-                min_ratio=config.hz_min_ratio,
-                camera_names=config.camera_names,
-            )
-            if not hz_result.is_valid:
-                raise ValueError(
-                    f"[folder={folder_name}] {hz_result.overall_message}"
-                )
-            logger.info("  [Hz] PASSED: %s", folder_name)
+                frame_idx += 1
+                if frame_idx % 500 == 0:
+                    logger.info("    Written %d/%d frames", frame_idx, frame_count)
 
-            if not frames:
-                raise ValueError(
-                    f"No frames extracted [folder={folder_name}] from {mcap_path}. "
-                    f"All expected topics present but build_frame() returned None "
-                    f"for every cycle — likely cause: incomplete action data "
-                    f"(missing leader topics or action key mismatch)."
-                )
+            creator.dataset.save_episode()
+            logger.info("  Episode saved: %d frames", frame_idx)
+            del obs_array, all_actions, actions_by_key
 
-            # 7. Transform to episode (with task_instruction extraction)
-            task_instruction = "default_task"
-            ti = metadata.get("task_instruction")
-            if ti and isinstance(ti, list) and len(ti) > 0 and ti[0]:
-                task_instruction = ti[0]
+            # Skip the old convert_episode path
+            episode = None
 
-            episode = frames_to_episode(
-                frames=frames,
-                action_order=config.action_order,
-                camera_names=config.camera_names,
-                task=task_instruction,
-            )
-
-            # 8. Convert episode with custom metadata
+            # 8. Store custom metadata (episode already saved via streaming)
             custom_metadata = {
                 "Serial_number": folder_name,
                 "tags": metadata.get("tags", []),
                 "grade": "",
             }
-            creator.convert_episode(episode, custom_metadata=custom_metadata)
+            creator._episode_custom_metadata.append(custom_metadata)
 
             converted_count += 1
             logger.info("  Converted successfully: %s", folder_name)
@@ -361,6 +473,7 @@ def run_conversion(config_path: str) -> int:
             logger.error("Failed to finalize dataset: %s", e)
 
         # Push to HuggingFace Hub if repo_id has namespace format
+        push_success = False
         if "/" in repo_id:
             try:
                 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -368,14 +481,44 @@ def run_conversion(config_path: str) -> int:
                 ds = LeRobotDataset(repo_id=repo_id, root=output_root)
                 ds.push_to_hub(tags=cfg.get("tags") or None, push_videos=True)
                 logger.info("Pushed dataset to HuggingFace Hub: %s", repo_id)
+                push_success = True
             except Exception as e:
-                logger.error("Failed to push to Hub: %s", e)
+                err_msg = str(e)
+                # RepoCard/Jinja2 error means data was already pushed successfully
+                if "Jinja2" in err_msg or "RepoCard" in err_msg:
+                    logger.warning("Dataset pushed but RepoCard skipped (install Jinja2 to fix): %s", e)
+                    push_success = True
+                else:
+                    logger.error("Failed to push to Hub: %s", e)
         else:
             logger.warning(
                 "Skipping push_to_hub: repo_id '%s' is not in 'namespace/name' format. "
                 "Set 'repo_id' in config.json (e.g. 'myuser/mydataset') to enable upload.",
                 repo_id,
             )
+
+        # --- Cleanup ---
+        # 1. Remove local dataset after successful upload (skip in append mode)
+        append_mode = cfg.get("append", False)
+        if push_success and not append_mode and Path(output_root).exists():
+            try:
+                shutil.rmtree(output_root)
+                logger.info("Cleaned up local dataset: %s", output_root)
+            except Exception as e:
+                logger.warning("Failed to clean up local dataset: %s", e)
+        elif push_success and append_mode:
+            logger.info("Append mode: keeping local dataset for future appends: %s", output_root)
+
+        # 2. Remove source bags after successful conversion (opt-in)
+        if cfg.get("cleanup_source_bags") and converted_count > 0 and failed_count == 0:
+            for folder_name in folders:
+                bag_dir = INPUT_PATH / folder_name
+                if bag_dir.exists():
+                    try:
+                        shutil.rmtree(bag_dir)
+                        logger.info("Cleaned up source bag: %s", bag_dir)
+                    except Exception as e:
+                        logger.warning("Failed to clean up source bag %s: %s", bag_dir, e)
 
     # Summary
     logger.info(

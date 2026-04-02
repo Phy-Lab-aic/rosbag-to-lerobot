@@ -287,7 +287,8 @@ def frames_to_episode(
         "images": camera_lists,
         "task": task,
     }
+
     for key in action_order:
-        episode[key] = np.stack(action_lists[key], axis=0)
+        episode[key] = np.stack(action_lists[key], axis=0).astype(np.float32)
 
     return episode

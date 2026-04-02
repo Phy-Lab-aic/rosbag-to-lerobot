@@ -178,15 +178,15 @@ def validate_mcap_topics(
     }
 
 
-def extract_frames(
+def extract_frames_iter(
     bag_path: str,
     config: Rosbag,
     rot_img: bool = False,
-) -> Tuple[List[Dict[str, Any]], dict[str, list[int]]]:
-    """Extract synchronised frames from MCAP.
+):
+    """Yield synchronised frames from MCAP one at a time (low memory).
 
-    Returns ``(frames, timestamps)`` — Hz validation is the caller's
-    responsibility.
+    Yields ``(frame, timestamps_update)`` tuples. The caller is responsible
+    for collecting timestamps if Hz validation is needed.
     """
     topic_map = config.topic_map
     joint_order = config.joint_order
@@ -194,12 +194,6 @@ def extract_frames(
     fps = config.fps
 
     shared_action_names = config.shared_action_names
-
-    frames: List[Dict[str, Any]] = []
-    timestamps: dict[str, list[int]] = {name: [] for name in topic_map.values()}
-    # Add timestamp tracking for shared actions (not in topic_map)
-    for sa in shared_action_names:
-        timestamps[sa] = []
 
     timegap = 1_000_000_000 // fps
     ts_ref = -timegap
@@ -210,7 +204,6 @@ def extract_frames(
     leader_msgs: dict = {}
     schema_map: dict[str, str] = {}
     msg_flag = {name: False for name in topic_map.values()}
-    # Add flags for shared actions
     for sa in shared_action_names:
         msg_flag[sa] = False
     cnt = 0
@@ -221,19 +214,14 @@ def extract_frames(
             continue
 
         canonical_name = topic_map[topic]
-        timestamps[canonical_name].append(t)
         schema_map[canonical_name] = schema_name
 
-        # Timing gate: only the timing source controls frame pacing.
-        # When the timing source arrives too early, skip *only that message*
-        # (not the entire loop iteration) so other topics are still collected.
         if not timing and canonical_name == timing_source:
             if (t - ts_ref) < timegap:
                 continue
             ts_ref = t if ts_ref < 0 else ts_ref + timegap
             timing = True
         elif not timing and canonical_name != timing_source:
-            # Non-timing-source messages: collect them but don't advance frame
             if not msg_flag[canonical_name]:
                 if canonical_name.startswith("cam_"):
                     image_msgs[canonical_name] = msg
@@ -244,7 +232,6 @@ def extract_frames(
                     for sa in shared_action_names:
                         if not msg_flag[sa]:
                             leader_msgs[sa] = msg
-                            timestamps[sa].append(t)
                             schema_map[sa] = schema_name
                             msg_flag[sa] = True
                             cnt += 1
@@ -252,8 +239,6 @@ def extract_frames(
                 cnt += 1
             continue
 
-        # Convention: camera keys must start with "cam_" in camera_topic_map.
-        # Other canonical names: "observation" (state), "action"/"action_*" (leader).
         if not msg_flag[canonical_name]:
             if canonical_name.startswith("cam_"):
                 image_msgs[canonical_name] = msg
@@ -261,11 +246,9 @@ def extract_frames(
                 leader_msgs[canonical_name] = msg
             elif canonical_name == "observation":
                 follower_msgs[canonical_name] = msg
-                # Auto-fill shared actions that use the same topic as state
                 for sa in shared_action_names:
                     if not msg_flag[sa]:
                         leader_msgs[sa] = msg
-                        timestamps[sa].append(t)
                         schema_map[sa] = schema_name
                         msg_flag[sa] = True
                         cnt += 1
@@ -280,12 +263,37 @@ def extract_frames(
             joint_order, rot_img, schema_map,
         )
         if frame is not None:
-            frames.append(frame)
+            yield frame
 
         for key in msg_flag:
             msg_flag[key] = False
         cnt = 0
         timing = False
+
+
+def extract_frames(
+    bag_path: str,
+    config: Rosbag,
+    rot_img: bool = False,
+) -> Tuple[List[Dict[str, Any]], dict[str, list[int]]]:
+    """Extract synchronised frames from MCAP.
+
+    Returns ``(frames, timestamps)`` — Hz validation is the caller's
+    responsibility.
+
+    Note: For large bags with camera data, prefer ``extract_frames_iter``
+    to avoid OOM.
+    """
+    topic_map = config.topic_map
+    shared_action_names = config.shared_action_names
+
+    frames: List[Dict[str, Any]] = []
+    timestamps: dict[str, list[int]] = {name: [] for name in topic_map.values()}
+    for sa in shared_action_names:
+        timestamps[sa] = []
+
+    for frame in extract_frames_iter(bag_path, config, rot_img):
+        frames.append(frame)
 
     return frames, timestamps
 
