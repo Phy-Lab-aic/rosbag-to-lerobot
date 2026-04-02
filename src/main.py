@@ -494,6 +494,22 @@ def run_conversion(config_path: str) -> int:
                 repo_id,
             )
 
+        # --- Ensure version tag for LeRobot pull compatibility ---
+        if push_success and "/" in repo_id:
+            try:
+                from huggingface_hub import HfApi
+                info_path = Path(output_root) / "meta" / "info.json"
+                if info_path.is_file():
+                    with open(info_path) as f:
+                        version = json.load(f).get("codebase_version", "")
+                    if version:
+                        HfApi().create_tag(repo_id, tag=version, repo_type="dataset")
+                        logger.info("Created version tag '%s' on %s", version, repo_id)
+            except Exception as e:
+                # Tag already exists or other non-critical error
+                if "already exists" not in str(e).lower():
+                    logger.warning("Failed to create version tag: %s", e)
+
         # --- Cleanup ---
         # 1. Remove local dataset after successful upload (skip in append mode)
         append_mode = cfg.get("append", False)
