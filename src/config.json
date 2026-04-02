@@ -4,7 +4,6 @@
   "robot": "ur5e",
   "fps": 20,
   "folders": "all",
-
   "camera_topic_map": {
     "cam_left": "/left_camera/image",
     "cam_center": "/center_camera/image",
@@ -24,5 +23,6 @@
   },
   "append": true,
   "task_instruction": [],
-  "tags": []
+  "tags": [],
+  "cleanup_source_bags": false
 }

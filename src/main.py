@@ -330,7 +330,7 @@ def run_conversion(config_path: str) -> int:
                 if first_frame_images is None and config.camera_names:
                     import cv2
                     first_frame_images = {
-                        cam: cv2.resize(frame["images"][cam], None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+                        cam: frame["images"][cam]
                         for cam in config.camera_names
                         if cam in frame["images"]
                     }
@@ -419,10 +419,7 @@ def run_conversion(config_path: str) -> int:
                 }
                 for cam in config.camera_names:
                     if cam in frame["images"]:
-                        import cv2
-                        img = frame["images"][cam]
-                        img = cv2.resize(img, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
-                        lerobot_frame[f"observation.images.{cam}"] = img
+                        lerobot_frame[f"observation.images.{cam}"] = frame["images"][cam]
                 lerobot_frame["task"] = task_instruction
                 creator.dataset.add_frame(lerobot_frame)
 
