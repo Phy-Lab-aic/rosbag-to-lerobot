@@ -37,8 +37,7 @@
     "contacts": "/aic/gazebo/contacts/off_limit"
   },
   "scoring_yaml": "/home/lhj/aic/results/scoring.yaml",
-  "reward": {
-    "type": "distance",
+  "plug_tracking": {
     "plug_frame": "tip_link"
   }
 }

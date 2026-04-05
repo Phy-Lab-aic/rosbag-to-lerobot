@@ -293,7 +293,7 @@ def extract_frames_iter(
         merged_extra = {**extra_obs_msgs, **tf_msgs} if tf_msgs else extra_obs_msgs
         # Pass plug_frame hint for TF matching
         frame_schema_map = dict(schema_map)
-        plug_frame = config.reward_config.get("plug_frame", "")
+        plug_frame = config.plug_config.get("plug_frame", "")
         if plug_frame:
             frame_schema_map["_plug_frame"] = plug_frame
         frame = build_frame(
@@ -390,10 +390,10 @@ def build_extraction_config(
         "action": action_joint_order,
     }
 
-    # 4. v2 schema: extra observation / event / reward / scoring
+    # 4. v2 schema: extra observation / event / plug tracking / scoring
     extra_obs_topics: dict[str, str] = detail.get("extra_observation_topics", {})
     event_topics: dict[str, str] = detail.get("event_topics", {})
-    reward_config: dict = detail.get("reward", {})
+    plug_config: dict = detail.get("plug_tracking", {})
     scoring_yaml_path: str = detail.get("scoring_yaml", "")
 
     # Add extra_obs and event topics to topic_map so they are routed
@@ -413,6 +413,6 @@ def build_extraction_config(
         shared_action_names=shared_action_names,
         extra_obs_topics=extra_obs_topics,
         event_topics=event_topics,
-        reward_config=reward_config,
+        plug_config=plug_config,
         scoring_yaml_path=scoring_yaml_path,
     )

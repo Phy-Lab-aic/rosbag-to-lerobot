@@ -21,7 +21,7 @@ except ImportError:
     yaml = None  # graceful degradation: scoring.yaml support disabled
 
 from v3_conversion.constants import CONFIG_PATH, INPUT_PATH, OUTPUT_PATH
-from v3_conversion.data_converter import frames_to_episode
+from v3_conversion.data_converter import frames_to_episode  # noqa: F401 (used by external callers)
 from v3_conversion.data_creator import DataCreator
 from v3_conversion.hz_checker import validate_from_timestamps
 from v3_conversion.mcap_reader import (
@@ -92,7 +92,7 @@ def _load_config(config_path: str) -> dict:
         # v2 schema fields
         "extra_observation_topics": config.get("extra_observation_topics", {}),
         "event_topics": config.get("event_topics", {}),
-        "reward": config.get("reward", {}),
+        "plug_tracking": config.get("plug_tracking", {}),
         "scoring_yaml": config.get("scoring_yaml", ""),
     }
 
@@ -142,7 +142,7 @@ def _load_metacard(
         # v2 schema fields (pass through from config defaults)
         "extra_observation_topics": metacard.get("extra_observation_topics", defaults.get("extra_observation_topics", {})),
         "event_topics": metacard.get("event_topics", defaults.get("event_topics", {})),
-        "reward": metacard.get("reward", defaults.get("reward", {})),
+        "plug_tracking": metacard.get("plug_tracking", defaults.get("plug_tracking", {})),
         "scoring_yaml": metacard.get("scoring_yaml", defaults.get("scoring_yaml", "")),
     }
 
@@ -211,57 +211,8 @@ def _load_scoring_yaml(path: str, results_dir: Path) -> dict:
 
 
 # ------------------------------------------------------------------
-# Reward computation
+# Extra observation specs
 # ------------------------------------------------------------------
-
-def _compute_dense_reward(episode: dict, reward_config: dict) -> np.ndarray:
-    """Compute per-frame HEURISTIC reward from episode data.
-
-    WARNING: This is NOT a ground-truth reward from the AIC scoring system.
-    It is a hand-crafted approximation: -distance + force_penalty + insertion_bonus.
-    The actual AIC scores (tier2/tier3) are sparse and stored in episode metadata.
-
-    Returns float32 array of shape (N,).
-    """
-    extra_obs = episode.get("extra_obs", {})
-    n_frames = 0
-
-    # Determine frame count from available data
-    if "obs" in episode:
-        n_frames = len(episode["obs"])
-    elif extra_obs:
-        for v in extra_obs.values():
-            if hasattr(v, '__len__'):
-                n_frames = len(v)
-                break
-
-    if n_frames == 0:
-        return np.zeros(0, dtype=np.float32)
-
-    reward = np.zeros(n_frames, dtype=np.float32)
-    force_threshold = float(reward_config.get("force_threshold", 10.0))
-    insertion_bonus = float(reward_config.get("insertion_bonus", 10.0))
-
-    # Distance-based reward: reward = -distance
-    if "plug_port_distance" in extra_obs:
-        distances = np.asarray(extra_obs["plug_port_distance"], dtype=np.float32)
-        if distances.ndim == 2:
-            distances = distances[:, 0]
-        reward += -distances
-
-    # Force penalty: -0.1 if ||force|| > threshold
-    if "wrench" in extra_obs:
-        wrench = np.asarray(extra_obs["wrench"], dtype=np.float32)
-        if wrench.ndim == 2 and wrench.shape[1] >= 3:
-            force_magnitude = np.linalg.norm(wrench[:, :3], axis=1)
-            reward += np.where(force_magnitude > force_threshold, -0.1, 0.0).astype(np.float32)
-
-    # Insertion bonus on last frame if success
-    if episode.get("success", False):
-        reward[-1] += insertion_bonus
-
-    return reward
-
 
 # ------------------------------------------------------------------
 # Extra observation config builder
@@ -428,27 +379,26 @@ def run_conversion(config_path: str) -> int:
         # v2 schema fields
         "extra_observation_topics": cfg.get("extra_observation_topics", {}),
         "event_topics": cfg.get("event_topics", {}),
-        "reward": cfg.get("reward", {}),
+        "plug_tracking": cfg.get("plug_tracking", {}),
         "scoring_yaml": cfg.get("scoring_yaml", ""),
     }
 
     # v2 schema: build extra observation config and load scoring
     extra_obs_topics = cfg.get("extra_observation_topics", {})
     event_topics = cfg.get("event_topics", {})
-    reward_config = cfg.get("reward", {})
+    plug_config = cfg.get("plug_tracking", {})
     scoring_yaml_path = cfg.get("scoring_yaml", "")
 
     extra_obs_config = _build_extra_obs_config(extra_obs_topics) if extra_obs_topics else {}
-    has_reward = bool(reward_config)
-    has_events = bool(event_topics)
+    has_episode_signals = bool(plug_config)
 
     # Load scoring.yaml once (trial-to-score mapping)
     scoring_data = _load_scoring_yaml(scoring_yaml_path, INPUT_PATH) if scoring_yaml_path else {}
 
     if extra_obs_config:
         logger.info("Extra observation topics configured: %s", list(extra_obs_config.keys()))
-    if has_reward:
-        logger.info("Reward computation enabled: %s", reward_config)
+    if has_episode_signals:
+        logger.info("Plug tracking enabled: %s", plug_config)
     if scoring_data:
         logger.info("Scoring data loaded for %d trials", len(scoring_data))
 
@@ -609,7 +559,6 @@ def run_conversion(config_path: str) -> int:
             scoring_meta = scoring_data.get(trial_key, {})
             episode_success = scoring_meta.get("success", False)
 
-            # (reward_heuristic removed — scoring metadata in episode metadata is sufficient)
 
             # --- Initialize DataCreator ---
             if creator is None:
@@ -625,10 +574,8 @@ def run_conversion(config_path: str) -> int:
                 # Pass v2 schema extras only when configured
                 if extra_obs_config:
                     creator_kwargs["extra_obs_config"] = extra_obs_config
-                if has_reward:
-                    creator_kwargs["has_reward"] = True
-                if has_events:
-                    creator_kwargs["has_events"] = True
+                if has_episode_signals:
+                    creator_kwargs["has_episode_signals"] = True
                 creator = DataCreator(**creator_kwargs)
 
                 append_mode = cfg.get("append", False)
@@ -688,8 +635,8 @@ def run_conversion(config_path: str) -> int:
                 for name, arr in extra_obs_arrays.items():
                     if frame_idx < len(arr):
                         lerobot_frame[f"observation.{name}"] = arr[frame_idx]
-                # Add reward/done/success (LeRobot expects np.ndarray, not scalars)
-                if has_reward:
+                # Add episode signals (LeRobot expects np.ndarray, not scalars)
+                if has_episode_signals:
                     lerobot_frame["next.done"] = np.array([frame_idx == frame_count - 1], dtype=bool)
                     lerobot_frame["next.success"] = np.array([(frame_idx == frame_count - 1) and episode_success], dtype=bool)
                 lerobot_frame["task"] = task_instruction

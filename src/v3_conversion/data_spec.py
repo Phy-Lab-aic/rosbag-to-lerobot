@@ -33,10 +33,9 @@ class Rosbag:
     #        "contacts": "/aic/gazebo/contacts/off_limit"}
     event_topics: Dict[str, str] = field(default_factory=dict)
 
-    # Reward computation parameters.
-    # e.g. {"plug_frame": "cable_0/plug_sfp_link", "port_frame": "...",
-    #        "force_penalty_threshold": 20.0, "insertion_bonus": 10.0}
-    reward_config: Dict[str, Any] = field(default_factory=dict)
+    # Plug tracking parameters for TF-based plug pose extraction.
+    # e.g. {"plug_frame": "tip_link"}
+    plug_config: Dict[str, Any] = field(default_factory=dict)
 
     # Path to scoring.yaml for episode-level metadata.
     scoring_yaml_path: str = ""

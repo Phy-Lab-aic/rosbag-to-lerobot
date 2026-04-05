@@ -38,8 +38,7 @@ class DataCreator:
         robot_type: str = "custom_robot",
         use_videos: bool = True,
         extra_obs_config: dict = None,
-        has_reward: bool = False,
-        has_events: bool = False,
+        has_episode_signals: bool = False,
     ):
 
         self.repo_id = repo_id
@@ -55,8 +54,7 @@ class DataCreator:
         self._episode_custom_metadata: List[Dict[str, Any]] = []
 
         self.extra_obs_config = extra_obs_config
-        self.has_reward = has_reward
-        self.has_events = has_events
+        self.has_episode_signals = has_episode_signals
 
         if "v3" not in version:
             raise RuntimeError(
@@ -123,7 +121,7 @@ class DataCreator:
                 }
 
         # Done/success (episode boundary signals)
-        if self.has_reward:
+        if self.has_episode_signals:
             features["next.done"] = {"dtype": "bool", "shape": (1,), "names": None}
             features["next.success"] = {"dtype": "bool", "shape": (1,), "names": None}
 
@@ -205,7 +203,7 @@ class DataCreator:
                         frame[f"observation.{key}"] = arr[t]
 
             # Done/success
-            if self.has_reward:
+            if self.has_episode_signals:
                 frame["next.done"] = (t == frame_count - 1)
                 frame["next.success"] = (t == frame_count - 1) and episode.get("success", False)
 

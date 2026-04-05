@@ -183,21 +183,20 @@ def _handle_controller_state_full(msg) -> Dict[str, np.ndarray]:
     }
 
 
-def _handle_tf_to_pose(msg, target_frame_id: str) -> Optional[np.ndarray]:
-    """Handle tf2_msgs/msg/TFMessage -> float32[7] for a target frame.
 
-    Searches msg.transforms for a transform whose child_frame_id matches
-    or contains ``target_frame_id``.  Returns position(3) + quaternion(4)
-    as float32[7], or None if the target frame is not found.
+def _extract_plug_pose(tf_msg, plug_frame: str) -> Optional[np.ndarray]:
+    """Extract plug pose from TFMessage by matching child_frame_id.
+
+    Returns position(3) + quaternion(4) as float32[7], or None if not found.
     """
-    for t in msg.transforms:
-        if target_frame_id in t.child_frame_id:
+    if not plug_frame:
+        return None
+    for t in getattr(tf_msg, 'transforms', []):
+        if plug_frame in t.child_frame_id:
             tr = t.transform.translation
             ro = t.transform.rotation
             return np.array(
-                [tr.x, tr.y, tr.z, ro.x, ro.y, ro.z, ro.w],
-                dtype=np.float32,
-            )
+                [tr.x, tr.y, tr.z, ro.x, ro.y, ro.z, ro.w], dtype=np.float32)
     return None
 
 
@@ -407,16 +406,10 @@ def build_frame(
             e_schema = _extra_map.get(canon_name, "")
             # TF messages need special handling (target_frame_id required)
             if e_schema == "tf2_msgs/msg/TFMessage":
-                # Extract plug pose by matching child_frame_id
                 plug_frame = (extra_schema_map or {}).get("_plug_frame", "")
-                for t in getattr(value, 'transforms', []):
-                    child = t.child_frame_id
-                    if plug_frame and plug_frame in child:
-                        tr = t.transform.translation
-                        ro = t.transform.rotation
-                        extra_obs_data["plug_pose"] = np.array(
-                            [tr.x, tr.y, tr.z, ro.x, ro.y, ro.z, ro.w], dtype=np.float32)
-                        break
+                pose = _extract_plug_pose(value, plug_frame)
+                if pose is not None:
+                    extra_obs_data["plug_pose"] = pose
                 continue
             handler = _EXTRA_HANDLERS.get(e_schema)
             if handler is None:
