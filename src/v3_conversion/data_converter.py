@@ -7,7 +7,7 @@ Message type dispatch uses schema-name strings from MCAP channel metadata
 instead of ROS2 isinstance() checks.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -27,13 +27,32 @@ def _handle_joint_trajectory(msg_data, joint_order: List[str]) -> np.ndarray:
 
 
 def _handle_joint_state(msg_data, joint_order: List[str]) -> np.ndarray:
-    """Handle sensor_msgs/msg/JointState."""
+    """Handle sensor_msgs/msg/JointState — positions only."""
     joint_pos_map = dict(zip(msg_data.name, msg_data.position))
     missing = [name for name in joint_order if name not in joint_pos_map]
     if missing:
         raise KeyError(f"Missing joints in JointState: {missing}")
     ordered = [joint_pos_map[name] for name in joint_order]
     return np.array(ordered, dtype=np.float32)
+
+
+def _handle_joint_state_full(msg_data, joint_order: List[str]) -> np.ndarray:
+    """Handle sensor_msgs/msg/JointState — positions + velocities + efforts."""
+    joint_pos_map = dict(zip(msg_data.name, msg_data.position))
+    missing = [name for name in joint_order if name not in joint_pos_map]
+    if missing:
+        raise KeyError(f"Missing joints in JointState: {missing}")
+    result = [joint_pos_map[name] for name in joint_order]
+
+    if msg_data.velocity and len(msg_data.velocity) >= len(msg_data.name):
+        vel_map = dict(zip(msg_data.name, msg_data.velocity))
+        result += [vel_map[name] for name in joint_order]
+
+    if msg_data.effort and len(msg_data.effort) >= len(msg_data.name):
+        eff_map = dict(zip(msg_data.name, msg_data.effort))
+        result += [eff_map[name] for name in joint_order]
+
+    return np.array(result, dtype=np.float32)
 
 
 def _handle_odometry(msg_data, joint_order: List[str]) -> np.ndarray:
@@ -92,12 +111,116 @@ def _handle_controller_state(msg_data, joint_order: List[str]) -> np.ndarray:
     return np.array(positions, dtype=np.float32)
 
 
+def _handle_joint_motion_update(msg_data, joint_order: List[str]) -> np.ndarray:
+    """Handle aic_control_interfaces/msg/JointMotionUpdate.
+
+    Extracts joint positions from the ``target_state`` field
+    (trajectory_msgs/JointTrajectoryPoint).
+    """
+    positions = list(msg_data.target_state.positions)
+    if joint_order and len(positions) != len(joint_order):
+        raise ValueError(
+            f"JointMotionUpdate.target_state has {len(positions)} "
+            f"positions but joint_order expects {len(joint_order)}"
+        )
+    return np.array(positions, dtype=np.float32)
+
+
 _JOINT_HANDLERS = {
     "trajectory_msgs/msg/JointTrajectory": _handle_joint_trajectory,
     "sensor_msgs/msg/JointState": _handle_joint_state,
     "nav_msgs/msg/Odometry": _handle_odometry,
     "geometry_msgs/msg/Twist": _handle_twist,
     "aic_control_interfaces/msg/ControllerState": _handle_controller_state,
+    "aic_control_interfaces/msg/JointMotionUpdate": _handle_joint_motion_update,
+}
+
+
+# ------------------------------------------------------------------
+# Extra message handlers for v2 dataset schema
+# ------------------------------------------------------------------
+
+def _handle_wrench_stamped(msg, joint_order: List[str] = None) -> np.ndarray:
+    """Handle geometry_msgs/msg/WrenchStamped.
+
+    Extracts force (x, y, z) and torque (x, y, z).
+    ``joint_order`` is accepted for interface consistency but not used.
+    """
+    w = msg.wrench
+    return np.array(
+        [w.force.x, w.force.y, w.force.z,
+         w.torque.x, w.torque.y, w.torque.z],
+        dtype=np.float32,
+    )
+
+
+def _handle_controller_state_full(msg) -> Dict[str, np.ndarray]:
+    """Handle aic_control_interfaces/msg/ControllerState (full extraction).
+
+    Returns a dict with tcp_pose, tcp_velocity, tcp_error,
+    reference_tcp_pose, and target_mode arrays.
+    """
+    def _pose_to_array(pose):
+        p = pose.position
+        o = pose.orientation
+        return np.array(
+            [p.x, p.y, p.z, o.x, o.y, o.z, o.w], dtype=np.float32
+        )
+
+    def _twist_to_array(twist):
+        l = twist.linear
+        a = twist.angular
+        return np.array(
+            [l.x, l.y, l.z, a.x, a.y, a.z], dtype=np.float32
+        )
+
+    return {
+        "tcp_pose": _pose_to_array(msg.tcp_pose),
+        "tcp_velocity": _twist_to_array(msg.tcp_velocity),
+        "tcp_error": np.array(msg.tcp_error, dtype=np.float32),
+        "reference_tcp_pose": _pose_to_array(msg.reference_tcp_pose),
+        "target_mode": np.array([msg.target_mode.mode], dtype=np.float32),
+    }
+
+
+def _handle_tf_to_pose(msg, target_frame_id: str) -> Optional[np.ndarray]:
+    """Handle tf2_msgs/msg/TFMessage -> float32[7] for a target frame.
+
+    Searches msg.transforms for a transform whose child_frame_id matches
+    or contains ``target_frame_id``.  Returns position(3) + quaternion(4)
+    as float32[7], or None if the target frame is not found.
+    """
+    for t in msg.transforms:
+        if target_frame_id in t.child_frame_id:
+            tr = t.transform.translation
+            ro = t.transform.rotation
+            return np.array(
+                [tr.x, tr.y, tr.z, ro.x, ro.y, ro.z, ro.w],
+                dtype=np.float32,
+            )
+    return None
+
+
+def _handle_string_msg(msg) -> str:
+    """Handle std_msgs/msg/String."""
+    return msg.data
+
+
+def _handle_contacts_msg(msg) -> bool:
+    """Handle contact messages.
+
+    Returns True if any contacts are present, False otherwise.
+    """
+    contacts = getattr(msg, "contacts", getattr(msg, "states", []))
+    return len(contacts) > 0
+
+
+_EXTRA_HANDLERS = {
+    "geometry_msgs/msg/WrenchStamped": _handle_wrench_stamped,
+    "aic_control_interfaces/msg/ControllerState": _handle_controller_state_full,
+    # TF handled directly in build_frame (needs target_frame_id arg)
+    "std_msgs/msg/String": _handle_string_msg,
+    "ros_gz_interfaces/msg/Contacts": _handle_contacts_msg,
 }
 
 
@@ -209,6 +332,9 @@ def build_frame(
     joint_order: Dict[str, Any],
     rot_img: bool,
     schema_map: Dict[str, str],
+    extra_obs_msgs: Optional[Dict[str, Any]] = None,
+    event_msgs: Optional[Dict[str, Any]] = None,
+    extra_schema_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any] | None:
     """Convert accumulated deserialized messages into a single frame dict.
 
@@ -219,6 +345,14 @@ def build_frame(
     schema_map : dict[str, str]
         Maps canonical name -> MCAP schema name (e.g.,
         ``"observation" -> "sensor_msgs/msg/JointState"``).
+    extra_obs_msgs : dict, optional
+        Additional observation messages keyed by canonical name, processed
+        via ``_EXTRA_HANDLERS``.
+    event_msgs : dict, optional
+        Event messages keyed by canonical name, processed via
+        ``_EXTRA_HANDLERS``.
+    extra_schema_map : dict, optional
+        Maps canonical name -> MCAP schema name for extra/event messages.
     """
     # -- images (schema-based dispatch: raw Image or CompressedImage) --
     camera_data = {}
@@ -228,14 +362,19 @@ def build_frame(
             _decode_image(value, img_schema), cv2.COLOR_BGR2RGB
         )
 
-    # -- observation (follower) --
+    # -- observation (follower) — use full state (pos+vel+effort) when available --
     follower_arrays: list = []
     for canon_name, value in (follower_msgs or {}).items():
         if value is not None:
             obs_schema = schema_map.get(canon_name, "")
-            follower_arrays.append(
-                _convert_joint_msg(value, joint_order["obs"], obs_schema)
-            )
+            if obs_schema == "sensor_msgs/msg/JointState":
+                follower_arrays.append(
+                    _handle_joint_state_full(value, joint_order["obs"])
+                )
+            else:
+                follower_arrays.append(
+                    _convert_joint_msg(value, joint_order["obs"], obs_schema)
+                )
     follower_data = np.concatenate(follower_arrays) if follower_arrays else np.array([], dtype=np.float32)
 
     # -- action (leader) --
@@ -256,7 +395,58 @@ def build_frame(
             if "wrist" in k:
                 camera_data[k] = v[::-1, ::-1].copy()
 
-    return {"images": camera_data, "obs": follower_data, "action": action_data}
+    result = {"images": camera_data, "obs": follower_data, "action": action_data}
+
+    # -- extra observations (v2 schema) --
+    if extra_obs_msgs:
+        _extra_map = extra_schema_map or {}
+        extra_obs_data: Dict[str, Any] = {}
+        for canon_name, value in extra_obs_msgs.items():
+            if value is None:
+                continue
+            e_schema = _extra_map.get(canon_name, "")
+            # TF messages need special handling (target_frame_id required)
+            if e_schema == "tf2_msgs/msg/TFMessage":
+                # Extract plug pose by matching child_frame_id
+                plug_frame = (extra_schema_map or {}).get("_plug_frame", "")
+                for t in getattr(value, 'transforms', []):
+                    child = t.child_frame_id
+                    if plug_frame and plug_frame in child:
+                        tr = t.transform.translation
+                        ro = t.transform.rotation
+                        extra_obs_data["plug_pose"] = np.array(
+                            [tr.x, tr.y, tr.z, ro.x, ro.y, ro.z, ro.w], dtype=np.float32)
+                        break
+                continue
+            handler = _EXTRA_HANDLERS.get(e_schema)
+            if handler is None:
+                continue  # skip unknown schemas gracefully
+            result_val = handler(value)
+            # If handler returns a dict (e.g. controller_state_full), flatten into extra_obs
+            if isinstance(result_val, dict):
+                for sub_key, sub_val in result_val.items():
+                    extra_obs_data[sub_key] = sub_val
+            else:
+                extra_obs_data[canon_name] = result_val
+        if extra_obs_data:
+            result["extra_obs"] = extra_obs_data
+
+    # -- events (v2 schema) --
+    if event_msgs:
+        _extra_map = extra_schema_map or {}
+        events_data: Dict[str, Any] = {}
+        for canon_name, value in event_msgs.items():
+            if value is None:
+                continue
+            e_schema = _extra_map.get(canon_name, "")
+            handler = _EXTRA_HANDLERS.get(e_schema)
+            if handler is None:
+                continue  # skip unknown schemas gracefully
+            events_data[canon_name] = handler(value)
+        if events_data:
+            result["events"] = events_data
+
+    return result
 
 
 def frames_to_episode(
@@ -270,6 +460,20 @@ def frames_to_episode(
     action_lists = {key: [] for key in action_order}
     camera_lists = {cam: [] for cam in camera_names}
 
+    # Discover extra_obs and events keys from the first frame that has them
+    extra_obs_keys: List[str] = []
+    events_keys: List[str] = []
+    for f in frames:
+        if "extra_obs" in f and not extra_obs_keys:
+            extra_obs_keys = list(f["extra_obs"].keys())
+        if "events" in f and not events_keys:
+            events_keys = list(f["events"].keys())
+        if extra_obs_keys and events_keys:
+            break
+
+    extra_obs_lists: Dict[str, list] = {k: [] for k in extra_obs_keys}
+    events_lists: Dict[str, list] = {k: [] for k in events_keys}
+
     for f in frames:
         obs_list.append(np.asarray(f["obs"], dtype=np.float32))
 
@@ -282,6 +486,20 @@ def frames_to_episode(
             if cam in imgs:
                 camera_lists[cam].append(imgs[cam])
 
+        # Collect extra_obs
+        if extra_obs_keys:
+            extra_obs = f.get("extra_obs", {})
+            for k in extra_obs_keys:
+                if k in extra_obs:
+                    extra_obs_lists[k].append(extra_obs[k])
+
+        # Collect events
+        if events_keys:
+            events = f.get("events", {})
+            for k in events_keys:
+                if k in events:
+                    events_lists[k].append(events[k])
+
     episode = {
         "obs": np.stack(obs_list, axis=0),
         "images": camera_lists,
@@ -290,5 +508,38 @@ def frames_to_episode(
 
     for key in action_order:
         episode[key] = np.stack(action_lists[key], axis=0).astype(np.float32)
+
+    # Stack extra_obs arrays into episode
+    if extra_obs_keys:
+        extra_obs_episode: Dict[str, Any] = {}
+        for k, vals in extra_obs_lists.items():
+            if not vals:
+                continue
+            if isinstance(vals[0], dict):
+                # Dict-valued handler (e.g. _handle_controller_state_full)
+                sub_keys = vals[0].keys()
+                extra_obs_episode[k] = {
+                    sk: np.stack([v[sk] for v in vals], axis=0)
+                    for sk in sub_keys
+                }
+            elif isinstance(vals[0], np.ndarray):
+                extra_obs_episode[k] = np.stack(vals, axis=0)
+            else:
+                extra_obs_episode[k] = vals
+        if extra_obs_episode:
+            episode["extra_obs"] = extra_obs_episode
+
+    # Collect events into episode
+    if events_keys:
+        events_episode: Dict[str, Any] = {}
+        for k, vals in events_lists.items():
+            if not vals:
+                continue
+            if isinstance(vals[0], np.ndarray):
+                events_episode[k] = np.stack(vals, axis=0)
+            else:
+                events_episode[k] = vals
+        if events_episode:
+            episode["events"] = events_episode
 
     return episode

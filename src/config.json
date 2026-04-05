@@ -15,7 +15,8 @@
     "elbow_joint",
     "wrist_1_joint",
     "wrist_2_joint",
-    "wrist_3_joint"
+    "wrist_3_joint",
+    "gripper/left_finger_joint"
   ],
   "state_topic": "/joint_states",
   "action_topics_map": {
@@ -24,5 +25,20 @@
   "append": true,
   "task_instruction": [],
   "tags": [],
-  "cleanup_source_bags": false
+  "cleanup_source_bags": false,
+  "extra_observation_topics": {
+    "wrench": "/fts_broadcaster/wrench",
+    "controller_state": "/aic_controller/controller_state",
+    "scoring_tf": "/scoring/tf",
+    "tf_static": "/tf_static"
+  },
+  "event_topics": {
+    "insertion_event": "/scoring/insertion_event",
+    "contacts": "/aic/gazebo/contacts/off_limit"
+  },
+  "scoring_yaml": "/home/lhj/aic/results/scoring.yaml",
+  "reward": {
+    "type": "distance",
+    "plug_frame": "tip_link"
+  }
 }

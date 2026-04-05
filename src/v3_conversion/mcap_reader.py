@@ -195,6 +195,12 @@ def extract_frames_iter(
 
     shared_action_names = config.shared_action_names
 
+    # v2 schema: sets of canonical names for extra obs / event topics
+    extra_obs_canonical = set(config.extra_obs_topics.keys())
+    event_canonical = set(config.event_topics.keys())
+    # Best-effort canonical names should not block frame emission
+    best_effort_canonical = extra_obs_canonical | event_canonical
+
     timegap = 1_000_000_000 // fps
     ts_ref = -timegap
     timing_source = camera_names[0] if camera_names else "observation"
@@ -202,8 +208,18 @@ def extract_frames_iter(
     image_msgs: dict = {}
     follower_msgs: dict = {}
     leader_msgs: dict = {}
+    extra_obs_msgs: dict = {}
+    event_msgs: dict = {}
+    tf_msgs: dict = {}
+    tf_static_cache: dict | None = None  # stored once, reused for all frames
     schema_map: dict[str, str] = {}
-    msg_flag = {name: False for name in topic_map.values()}
+
+    # msg_flag only tracks required topics (cameras, observation, action)
+    # Extra obs and event topics are best-effort and excluded from the flag
+    msg_flag = {}
+    for name in topic_map.values():
+        if name not in best_effort_canonical:
+            msg_flag[name] = False
     for sa in shared_action_names:
         msg_flag[sa] = False
     cnt = 0
@@ -216,13 +232,28 @@ def extract_frames_iter(
         canonical_name = topic_map[topic]
         schema_map[canonical_name] = schema_name
 
+        # -- Best-effort: extra obs and event topics (always store latest) --
+        if canonical_name in extra_obs_canonical:
+            if canonical_name == "tf_static":
+                if tf_static_cache is None:
+                    tf_static_cache = msg
+                tf_msgs["tf_static"] = tf_static_cache
+            elif canonical_name == "scoring_tf":
+                tf_msgs["scoring_tf"] = msg
+            else:
+                extra_obs_msgs[canonical_name] = msg
+            continue
+        if canonical_name in event_canonical:
+            event_msgs[canonical_name] = msg
+            continue
+
         if not timing and canonical_name == timing_source:
             if (t - ts_ref) < timegap:
                 continue
             ts_ref = t if ts_ref < 0 else ts_ref + timegap
             timing = True
         elif not timing and canonical_name != timing_source:
-            if not msg_flag[canonical_name]:
+            if not msg_flag.get(canonical_name, True):
                 if canonical_name.startswith("cam_"):
                     image_msgs[canonical_name] = msg
                 elif canonical_name == "action" or canonical_name.startswith("action_"):
@@ -239,7 +270,7 @@ def extract_frames_iter(
                 cnt += 1
             continue
 
-        if not msg_flag[canonical_name]:
+        if not msg_flag.get(canonical_name, True):
             if canonical_name.startswith("cam_"):
                 image_msgs[canonical_name] = msg
             elif canonical_name == "action" or canonical_name.startswith("action_"):
@@ -258,9 +289,19 @@ def extract_frames_iter(
         if cnt < len(msg_flag):
             continue
 
+        # Merge tf_msgs into extra_obs for build_frame
+        merged_extra = {**extra_obs_msgs, **tf_msgs} if tf_msgs else extra_obs_msgs
+        # Pass plug_frame hint for TF matching
+        frame_schema_map = dict(schema_map)
+        plug_frame = config.reward_config.get("plug_frame", "")
+        if plug_frame:
+            frame_schema_map["_plug_frame"] = plug_frame
         frame = build_frame(
             image_msgs, follower_msgs, leader_msgs,
             joint_order, rot_img, schema_map,
+            extra_obs_msgs=merged_extra or None,
+            event_msgs=event_msgs or None,
+            extra_schema_map=frame_schema_map,
         )
         if frame is not None:
             yield frame
@@ -269,6 +310,10 @@ def extract_frames_iter(
             msg_flag[key] = False
         cnt = 0
         timing = False
+        # Reset per-frame best-effort data (tf_static persists via cache)
+        extra_obs_msgs = {}
+        event_msgs = {}
+        tf_msgs = {"tf_static": tf_static_cache} if tf_static_cache is not None else {}
 
 
 def extract_frames(
@@ -345,6 +390,18 @@ def build_extraction_config(
         "action": action_joint_order,
     }
 
+    # 4. v2 schema: extra observation / event / reward / scoring
+    extra_obs_topics: dict[str, str] = detail.get("extra_observation_topics", {})
+    event_topics: dict[str, str] = detail.get("event_topics", {})
+    reward_config: dict = detail.get("reward", {})
+    scoring_yaml_path: str = detail.get("scoring_yaml", "")
+
+    # Add extra_obs and event topics to topic_map so they are routed
+    for canonical, topic in extra_obs_topics.items():
+        topic_map[topic] = canonical
+    for canonical, topic in event_topics.items():
+        topic_map[topic] = canonical
+
     return Rosbag(
         topic_map=topic_map,
         action_order=action_order,
@@ -354,4 +411,8 @@ def build_extraction_config(
         hz_min_ratio=HZ_MIN_RATIO,
         robot_type=robot_type,
         shared_action_names=shared_action_names,
+        extra_obs_topics=extra_obs_topics,
+        event_topics=event_topics,
+        reward_config=reward_config,
+        scoring_yaml_path=scoring_yaml_path,
     )

@@ -19,3 +19,24 @@ class Rosbag:
     robot_type: str = ""
     # Action canonical names whose source topic equals state_topic
     shared_action_names: List[str] = field(default_factory=list)
+
+    # --- v2 schema fields ------------------------------------------------
+
+    # Maps canonical name → ROS topic for additional observation sources.
+    # e.g. {"wrench": "/fts_broadcaster/wrench",
+    #        "controller_state": "/aic_controller/controller_state",
+    #        "scoring_tf": "/scoring/tf", "tf_static": "/tf_static"}
+    extra_obs_topics: Dict[str, str] = field(default_factory=dict)
+
+    # Maps canonical name → ROS topic for discrete event sources.
+    # e.g. {"insertion_event": "/scoring/insertion_event",
+    #        "contacts": "/aic/gazebo/contacts/off_limit"}
+    event_topics: Dict[str, str] = field(default_factory=dict)
+
+    # Reward computation parameters.
+    # e.g. {"plug_frame": "cable_0/plug_sfp_link", "port_frame": "...",
+    #        "force_penalty_threshold": 20.0, "insertion_bonus": 10.0}
+    reward_config: Dict[str, Any] = field(default_factory=dict)
+
+    # Path to scoring.yaml for episode-level metadata.
+    scoring_yaml_path: str = ""

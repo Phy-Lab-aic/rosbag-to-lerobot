@@ -37,6 +37,9 @@ class DataCreator:
         root: str = "./datasets",
         robot_type: str = "custom_robot",
         use_videos: bool = True,
+        extra_obs_config: dict = None,
+        has_reward: bool = False,
+        has_events: bool = False,
     ):
 
         self.repo_id = repo_id
@@ -50,6 +53,10 @@ class DataCreator:
         self.camera_names = camera_names
         self.dataset = None
         self._episode_custom_metadata: List[Dict[str, Any]] = []
+
+        self.extra_obs_config = extra_obs_config
+        self.has_reward = has_reward
+        self.has_events = has_events
 
         if "v3" not in version:
             raise RuntimeError(
@@ -72,7 +79,11 @@ class DataCreator:
 
     def create_dataset(self, episode: Dict[str, Any]) -> None:
 
-        obs_dim = len(self.joint_order["obs"])
+        # Infer obs_dim from actual data (may include velocity+effort)
+        if "obs" in episode and len(episode["obs"]) > 0:
+            obs_dim = episode["obs"].shape[-1] if hasattr(episode["obs"], 'shape') else len(episode["obs"][0])
+        else:
+            obs_dim = len(self.joint_order["obs"])
         action_cfg = self.joint_order["action"]
         action_joint_names = []
         for key in self.action_order:
@@ -101,6 +112,20 @@ class DataCreator:
                     "shape": (h, w, c),
                     "names": ["height", "width", "channels"],
                 }
+
+        # Extra observation features (from extra_obs_config)
+        if self.extra_obs_config:
+            for name, spec in self.extra_obs_config.items():
+                features[f"observation.{name}"] = {
+                    "dtype": "float32",
+                    "shape": spec["shape"],
+                    "names": spec.get("names"),
+                }
+
+        # Done/success (episode boundary signals)
+        if self.has_reward:
+            features["next.done"] = {"dtype": "bool", "shape": (1,), "names": None}
+            features["next.success"] = {"dtype": "bool", "shape": (1,), "names": None}
 
         dataset_root = Path(self.root)
         if dataset_root.exists():
@@ -172,6 +197,17 @@ class DataCreator:
             for cam_name in self.camera_names:
                 if cam_name in camera_lists:
                     frame[f"observation.images.{cam_name}"] = camera_lists[cam_name][t]
+
+            # Extra observations
+            if "extra_obs" in episode:
+                for key, arr in episode["extra_obs"].items():
+                    if isinstance(arr, np.ndarray) and len(arr) == frame_count:
+                        frame[f"observation.{key}"] = arr[t]
+
+            # Done/success
+            if self.has_reward:
+                frame["next.done"] = (t == frame_count - 1)
+                frame["next.success"] = (t == frame_count - 1) and episode.get("success", False)
 
             frame["task"] = task
             self.dataset.add_frame(frame)
@@ -424,6 +460,10 @@ class DataCreator:
                 if any(isinstance(v, list) for v in values):
                     arrow_values = [v if v is not None else [] for v in values]
                     col = pa.array(arrow_values, type=pa.list_(pa.string()))
+                elif all(isinstance(v, bool) for v in values if v is not None):
+                    col = pa.array(values, type=pa.bool_())
+                elif all(isinstance(v, (int, float)) for v in values if v is not None):
+                    col = pa.array(values, type=pa.float64())
                 else:
                     col = pa.array(values, type=pa.string())
 

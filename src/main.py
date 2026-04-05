@@ -13,6 +13,13 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
+try:
+    import yaml
+except ImportError:
+    yaml = None  # graceful degradation: scoring.yaml support disabled
+
 from v3_conversion.constants import CONFIG_PATH, INPUT_PATH, OUTPUT_PATH
 from v3_conversion.data_converter import frames_to_episode
 from v3_conversion.data_creator import DataCreator
@@ -82,6 +89,11 @@ def _load_config(config_path: str) -> dict:
         "tags": config.get("tags", []),
         "append": config.get("append", False),
         "cleanup_source_bags": config.get("cleanup_source_bags", False),
+        # v2 schema fields
+        "extra_observation_topics": config.get("extra_observation_topics", {}),
+        "event_topics": config.get("event_topics", {}),
+        "reward": config.get("reward", {}),
+        "scoring_yaml": config.get("scoring_yaml", ""),
     }
 
 
@@ -127,7 +139,176 @@ def _load_metacard(
         "joint_names": metacard.get("joint_names", defaults.get("joint_names", [])),
         "action_topics_map": metacard.get("action_topics_map", defaults.get("action_topics_map", {})),
         "state_topic": metacard.get("state_topic", defaults.get("state_topic", "")),
+        # v2 schema fields (pass through from config defaults)
+        "extra_observation_topics": metacard.get("extra_observation_topics", defaults.get("extra_observation_topics", {})),
+        "event_topics": metacard.get("event_topics", defaults.get("event_topics", {})),
+        "reward": metacard.get("reward", defaults.get("reward", {})),
+        "scoring_yaml": metacard.get("scoring_yaml", defaults.get("scoring_yaml", "")),
     }
+
+
+# ------------------------------------------------------------------
+# Scoring YAML loader
+# ------------------------------------------------------------------
+
+def _load_scoring_yaml(path: str, results_dir: Path) -> dict:
+    """Load scoring.yaml and return trial-indexed score dict.
+
+    If path is "auto", looks for scoring.yaml in results_dir.
+    Returns {} if not found or path is empty.
+    """
+    if not path:
+        return {}
+    if yaml is None:
+        logger.warning("pyyaml not installed; cannot load scoring.yaml")
+        return {}
+
+    if path == "auto":
+        scoring_path = results_dir / "scoring.yaml"
+    else:
+        scoring_path = Path(path)
+
+    if not scoring_path.is_file():
+        logger.info("scoring.yaml not found at %s", scoring_path)
+        return {}
+
+    with open(scoring_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    if not isinstance(raw, dict):
+        logger.warning("scoring.yaml has unexpected format (not a dict)")
+        return {}
+
+    result = {}
+    for trial_key, trial_data in raw.items():
+        if not isinstance(trial_data, dict):
+            continue
+        tier3 = trial_data.get("tier_3", {})
+        tier2 = trial_data.get("tier_2", {})
+        tier3_score = float(tier3.get("score", 0.0)) if isinstance(tier3, dict) else 0.0
+        tier2_total = float(tier2.get("score", 0.0)) if isinstance(tier2, dict) else 0.0
+        # Success = tier3_score >= 50.0 (partial or full insertion)
+        success = tier3_score >= 50.0
+        entry = {
+            "tier3_score": tier3_score,
+            "success": success,
+            "tier2_total": tier2_total,
+        }
+        # Include tier2 category breakdowns if available
+        if isinstance(tier2, dict) and "categories" in tier2:
+            categories = tier2["categories"]
+            if isinstance(categories, dict):
+                for cat_name, cat_data in categories.items():
+                    if isinstance(cat_data, dict) and "score" in cat_data:
+                        entry[f"tier2_{cat_name}"] = float(cat_data["score"])
+        # Include tier3 message if present
+        if isinstance(tier3, dict) and "message" in tier3:
+            entry["tier3_message"] = str(tier3["message"])
+        result[trial_key] = entry
+
+    logger.info("Loaded scoring.yaml: %d trials", len(result))
+    return result
+
+
+# ------------------------------------------------------------------
+# Reward computation
+# ------------------------------------------------------------------
+
+def _compute_dense_reward(episode: dict, reward_config: dict) -> np.ndarray:
+    """Compute per-frame HEURISTIC reward from episode data.
+
+    WARNING: This is NOT a ground-truth reward from the AIC scoring system.
+    It is a hand-crafted approximation: -distance + force_penalty + insertion_bonus.
+    The actual AIC scores (tier2/tier3) are sparse and stored in episode metadata.
+
+    Returns float32 array of shape (N,).
+    """
+    extra_obs = episode.get("extra_obs", {})
+    n_frames = 0
+
+    # Determine frame count from available data
+    if "obs" in episode:
+        n_frames = len(episode["obs"])
+    elif extra_obs:
+        for v in extra_obs.values():
+            if hasattr(v, '__len__'):
+                n_frames = len(v)
+                break
+
+    if n_frames == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    reward = np.zeros(n_frames, dtype=np.float32)
+    force_threshold = float(reward_config.get("force_threshold", 10.0))
+    insertion_bonus = float(reward_config.get("insertion_bonus", 10.0))
+
+    # Distance-based reward: reward = -distance
+    if "plug_port_distance" in extra_obs:
+        distances = np.asarray(extra_obs["plug_port_distance"], dtype=np.float32)
+        if distances.ndim == 2:
+            distances = distances[:, 0]
+        reward += -distances
+
+    # Force penalty: -0.1 if ||force|| > threshold
+    if "wrench" in extra_obs:
+        wrench = np.asarray(extra_obs["wrench"], dtype=np.float32)
+        if wrench.ndim == 2 and wrench.shape[1] >= 3:
+            force_magnitude = np.linalg.norm(wrench[:, :3], axis=1)
+            reward += np.where(force_magnitude > force_threshold, -0.1, 0.0).astype(np.float32)
+
+    # Insertion bonus on last frame if success
+    if episode.get("success", False):
+        reward[-1] += insertion_bonus
+
+    return reward
+
+
+# ------------------------------------------------------------------
+# Extra observation config builder
+# ------------------------------------------------------------------
+
+_EXTRA_OBS_SPECS = {
+    "wrench": {"shape": (6,), "names": ["fx", "fy", "fz", "tx", "ty", "tz"]},
+    "tcp_pose": {"shape": (7,), "names": ["x", "y", "z", "qx", "qy", "qz", "qw"]},
+    "tcp_velocity": {"shape": (6,), "names": ["vx", "vy", "vz", "wx", "wy", "wz"]},
+    "tcp_error": {"shape": (6,), "names": ["ex", "ey", "ez", "erx", "ery", "erz"]},
+    "reference_tcp_pose": {"shape": (7,), "names": ["x", "y", "z", "qx", "qy", "qz", "qw"]},
+    "plug_pose": {"shape": (7,), "names": ["x", "y", "z", "qx", "qy", "qz", "qw"]},
+    "target_mode": {"shape": (1,), "names": ["mode"]},
+}
+
+
+_CONTROLLER_STATE_SUB_KEYS = ["tcp_pose", "tcp_velocity", "tcp_error", "reference_tcp_pose", "target_mode"]
+_SCORING_TF_SUB_KEYS = ["plug_pose"]
+
+
+def _build_extra_obs_config(extra_obs_topics: dict) -> dict:
+    """Map extra topic canonical names to LeRobot feature specs.
+
+    Handles 1:N mappings: controller_state expands to tcp_pose, tcp_velocity, etc.
+    """
+    result = {}
+    for canonical_name, topic_path in extra_obs_topics.items():
+        if canonical_name in _EXTRA_OBS_SPECS:
+            result[canonical_name] = _EXTRA_OBS_SPECS[canonical_name].copy()
+            result[canonical_name]["topic"] = topic_path
+        elif canonical_name == "controller_state":
+            for sub_key in _CONTROLLER_STATE_SUB_KEYS:
+                if sub_key in _EXTRA_OBS_SPECS:
+                    result[sub_key] = _EXTRA_OBS_SPECS[sub_key].copy()
+                    result[sub_key]["topic"] = topic_path
+        elif canonical_name in ("scoring_tf", "tf_static"):
+            # TF topics produce plug_pose/port_pose via handler
+            for sub_key in _SCORING_TF_SUB_KEYS:
+                if sub_key in _EXTRA_OBS_SPECS and sub_key not in result:
+                    result[sub_key] = _EXTRA_OBS_SPECS[sub_key].copy()
+                    result[sub_key]["topic"] = topic_path
+        else:
+            logger.warning(
+                "Unknown extra observation topic '%s' (topic=%s), skipping",
+                canonical_name, topic_path,
+            )
+    return result
 
 
 # ------------------------------------------------------------------
@@ -244,7 +425,32 @@ def run_conversion(config_path: str) -> int:
         "action_topics_map": cfg.get("action_topics_map", {}),
         "task_instruction": cfg.get("task_instruction", []),
         "tags": cfg.get("tags", []),
+        # v2 schema fields
+        "extra_observation_topics": cfg.get("extra_observation_topics", {}),
+        "event_topics": cfg.get("event_topics", {}),
+        "reward": cfg.get("reward", {}),
+        "scoring_yaml": cfg.get("scoring_yaml", ""),
     }
+
+    # v2 schema: build extra observation config and load scoring
+    extra_obs_topics = cfg.get("extra_observation_topics", {})
+    event_topics = cfg.get("event_topics", {})
+    reward_config = cfg.get("reward", {})
+    scoring_yaml_path = cfg.get("scoring_yaml", "")
+
+    extra_obs_config = _build_extra_obs_config(extra_obs_topics) if extra_obs_topics else {}
+    has_reward = bool(reward_config)
+    has_events = bool(event_topics)
+
+    # Load scoring.yaml once (trial-to-score mapping)
+    scoring_data = _load_scoring_yaml(scoring_yaml_path, INPUT_PATH) if scoring_yaml_path else {}
+
+    if extra_obs_config:
+        logger.info("Extra observation topics configured: %s", list(extra_obs_config.keys()))
+    if has_reward:
+        logger.info("Reward computation enabled: %s", reward_config)
+    if scoring_data:
+        logger.info("Scoring data loaded for %d trials", len(scoring_data))
 
     if not folders:
         logger.error("No folders to convert")
@@ -295,8 +501,15 @@ def run_conversion(config_path: str) -> int:
                 folder_name, metadata, robot_type, fps_override
             )
 
-            # 3. Pre-check: all expected topics exist in MCAP
-            validation = validate_mcap_topics(str(mcap_path), config.topic_map)
+            # 3. Pre-check: required topics exist in MCAP
+            #    Extra obs and event topics are best-effort (may not appear in every bag)
+            best_effort_topics = set()
+            for t in config.extra_obs_topics.values():
+                best_effort_topics.add(t)
+            for t in config.event_topics.values():
+                best_effort_topics.add(t)
+            required_topic_map = {t: n for t, n in config.topic_map.items() if t not in best_effort_topics}
+            validation = validate_mcap_topics(str(mcap_path), required_topic_map)
             if validation["missing_topics"]:
                 raise ValueError(
                     f"MCAP topic pre-check failed [folder={folder_name}]: "
@@ -306,8 +519,6 @@ def run_conversion(config_path: str) -> int:
             # 5. Two-pass streaming conversion (avoids OOM on large bags)
             #    Pass 1: collect obs/action (small arrays only)
             #    Pass 2: stream images frame-by-frame to DataCreator
-            import numpy as np
-
             task_instruction = "default_task"
             ti = metadata.get("task_instruction")
             if ti and isinstance(ti, list) and len(ti) > 0 and ti[0]:
@@ -316,6 +527,7 @@ def run_conversion(config_path: str) -> int:
             # --- Pass 1: obs/action only ---
             obs_list = []
             action_lists = {key: [] for key in config.action_order}
+            extra_obs_lists = {name: [] for name in extra_obs_config} if extra_obs_config else {}
             first_frame_images = None
 
             frame_count = 0
@@ -327,6 +539,13 @@ def run_conversion(config_path: str) -> int:
                     action_lists[key].append(
                         np.asarray(frame["action"][key], dtype=np.float32)
                     )
+                # Collect extra observations if configured
+                if extra_obs_config and "extra_obs" in frame:
+                    for name in extra_obs_config:
+                        if name in frame["extra_obs"]:
+                            extra_obs_lists[name].append(
+                                np.asarray(frame["extra_obs"][name], dtype=np.float32)
+                            )
                 if first_frame_images is None and config.camera_names:
                     import cv2
                     first_frame_images = {
@@ -340,6 +559,11 @@ def run_conversion(config_path: str) -> int:
                 raise ValueError(
                     f"No frames extracted [folder={folder_name}] from {mcap_path}."
                 )
+
+            # Debug: log extra_obs collection stats
+            if extra_obs_config:
+                for name, values in extra_obs_lists.items():
+                    logger.info("  extra_obs '%s': %d/%d frames", name, len(values), frame_count)
 
             logger.info("  Pass 1 done: %d frames (obs/action collected)", frame_count)
 
@@ -355,9 +579,41 @@ def run_conversion(config_path: str) -> int:
                 [actions_by_key[key] for key in config.action_order], axis=-1
             ).astype(np.float32)
 
+            # Stack extra observation arrays (zero-fill missing frames)
+            extra_obs_arrays = {}
+            if extra_obs_config:
+                for name, values in extra_obs_lists.items():
+                    if len(values) == frame_count:
+                        extra_obs_arrays[name] = np.stack(values, axis=0).astype(np.float32)
+                    elif values:
+                        # Forward-fill: repeat last known value for missing frames
+                        padded = [np.asarray(v, dtype=np.float32) for v in values]
+                        last = padded[-1]
+                        while len(padded) < frame_count:
+                            padded.append(last.copy())
+                        extra_obs_arrays[name] = np.stack(padded[:frame_count], axis=0).astype(np.float32)
+                        logger.warning("  Extra obs '%s' has %d/%d frames, forward-filled", name, len(values), frame_count)
+                    elif creator is not None and name in extra_obs_config:
+                        # Zero-fill: feature is in schema (from earlier episode) but absent this episode
+                        shape = tuple(extra_obs_config[name]["shape"])
+                        extra_obs_arrays[name] = np.zeros((frame_count, *shape), dtype=np.float32)
+                        logger.warning("  Extra obs '%s' has 0/%d frames, zero-filled", name, frame_count)
+                del extra_obs_lists
+
+                # Filter extra_obs_config to only features actually collected
+                # (prevents schema/frame mismatch)
+                extra_obs_config = {k: v for k, v in extra_obs_config.items() if k in extra_obs_arrays}
+
+            # Trial-to-episode mapping for scoring.yaml
+            trial_key = f"trial_{idx + 1}"
+            scoring_meta = scoring_data.get(trial_key, {})
+            episode_success = scoring_meta.get("success", False)
+
+            # (reward_heuristic removed — scoring metadata in episode metadata is sufficient)
+
             # --- Initialize DataCreator ---
             if creator is None:
-                creator = DataCreator(
+                creator_kwargs = dict(
                     repo_id=repo_id,
                     root=output_root,
                     robot_type=config.robot_type,
@@ -366,6 +622,14 @@ def run_conversion(config_path: str) -> int:
                     camera_names=config.camera_names,
                     fps=config.fps,
                 )
+                # Pass v2 schema extras only when configured
+                if extra_obs_config:
+                    creator_kwargs["extra_obs_config"] = extra_obs_config
+                if has_reward:
+                    creator_kwargs["has_reward"] = True
+                if has_events:
+                    creator_kwargs["has_events"] = True
+                creator = DataCreator(**creator_kwargs)
 
                 append_mode = cfg.get("append", False)
                 dataset_root = Path(output_root)
@@ -420,6 +684,14 @@ def run_conversion(config_path: str) -> int:
                 for cam in config.camera_names:
                     if cam in frame["images"]:
                         lerobot_frame[f"observation.images.{cam}"] = frame["images"][cam]
+                # Add extra observations
+                for name, arr in extra_obs_arrays.items():
+                    if frame_idx < len(arr):
+                        lerobot_frame[f"observation.{name}"] = arr[frame_idx]
+                # Add reward/done/success (LeRobot expects np.ndarray, not scalars)
+                if has_reward:
+                    lerobot_frame["next.done"] = np.array([frame_idx == frame_count - 1], dtype=bool)
+                    lerobot_frame["next.success"] = np.array([(frame_idx == frame_count - 1) and episode_success], dtype=bool)
                 lerobot_frame["task"] = task_instruction
                 creator.dataset.add_frame(lerobot_frame)
 
@@ -429,7 +701,7 @@ def run_conversion(config_path: str) -> int:
 
             creator.dataset.save_episode()
             logger.info("  Episode saved: %d frames", frame_idx)
-            del obs_array, all_actions, actions_by_key
+            del obs_array, all_actions, actions_by_key, extra_obs_arrays
 
             # Skip the old convert_episode path
             episode = None
@@ -440,6 +712,15 @@ def run_conversion(config_path: str) -> int:
                 "tags": metadata.get("tags", []),
                 "grade": "",
             }
+            # Inject scoring.yaml metadata for this episode
+            if scoring_meta:
+                custom_metadata["scoring"] = scoring_meta
+                custom_metadata["success"] = episode_success
+                custom_metadata["tier3_score"] = scoring_meta.get("tier3_score", 0.0)
+                logger.info(
+                    "  Scoring metadata: trial=%s, success=%s, tier3=%.1f",
+                    trial_key, episode_success, scoring_meta.get("tier3_score", 0.0),
+                )
             creator._episode_custom_metadata.append(custom_metadata)
 
             converted_count += 1
