@@ -466,189 +466,156 @@ def run_conversion(config_path: str) -> int:
                     f"missing {validation['missing_topics']}"
                 )
 
-            # 5. Two-pass streaming conversion (avoids OOM on large bags)
-            #    Pass 1: collect obs/action (small arrays only)
-            #    Pass 2: stream images frame-by-frame to DataCreator
+            # 5. Single-pass streaming conversion
+            #    Read MCAP once: collect obs/action AND stream images simultaneously
             task_instruction = "default_task"
             ti = metadata.get("task_instruction")
             if ti and isinstance(ti, list) and len(ti) > 0 and ti[0]:
                 task_instruction = ti[0]
-
-            # --- Pass 1: obs/action only ---
-            obs_list = []
-            action_lists = {key: [] for key in config.action_order}
-            extra_obs_lists = {name: [] for name in extra_obs_config} if extra_obs_config else {}
-            first_frame_images = None
-
-            frame_count = 0
-            for frame in extract_frames_iter(
-                bag_path=str(mcap_path), config=config,
-            ):
-                obs_list.append(np.asarray(frame["obs"], dtype=np.float32))
-                for key in config.action_order:
-                    action_lists[key].append(
-                        np.asarray(frame["action"][key], dtype=np.float32)
-                    )
-                # Collect extra observations if configured
-                if extra_obs_config and "extra_obs" in frame:
-                    for name in extra_obs_config:
-                        if name in frame["extra_obs"]:
-                            extra_obs_lists[name].append(
-                                np.asarray(frame["extra_obs"][name], dtype=np.float32)
-                            )
-                if first_frame_images is None and config.camera_names:
-                    import cv2
-                    first_frame_images = {
-                        cam: frame["images"][cam]
-                        for cam in config.camera_names
-                        if cam in frame["images"]
-                    }
-                frame_count += 1
-
-            if frame_count == 0:
-                raise ValueError(
-                    f"No frames extracted [folder={folder_name}] from {mcap_path}."
-                )
-
-            # Debug: log extra_obs collection stats
-            if extra_obs_config:
-                for name, values in extra_obs_lists.items():
-                    logger.info("  extra_obs '%s': %d/%d frames", name, len(values), frame_count)
-
-            logger.info("  Pass 1 done: %d frames (obs/action collected)", frame_count)
-
-            # Collect obs/action arrays
-            obs_array = np.stack(obs_list, axis=0)
-            actions_by_key = {}
-            for key in config.action_order:
-                actions_by_key[key] = np.stack(action_lists[key], axis=0).astype(np.float32)
-            del obs_list, action_lists
-
-            # Concatenate action dims
-            all_actions = np.concatenate(
-                [actions_by_key[key] for key in config.action_order], axis=-1
-            ).astype(np.float32)
-
-            # Stack extra observation arrays (zero-fill missing frames)
-            extra_obs_arrays = {}
-            if extra_obs_config:
-                for name, values in extra_obs_lists.items():
-                    if len(values) == frame_count:
-                        extra_obs_arrays[name] = np.stack(values, axis=0).astype(np.float32)
-                    elif values:
-                        # Forward-fill: repeat last known value for missing frames
-                        padded = [np.asarray(v, dtype=np.float32) for v in values]
-                        last = padded[-1]
-                        while len(padded) < frame_count:
-                            padded.append(last.copy())
-                        extra_obs_arrays[name] = np.stack(padded[:frame_count], axis=0).astype(np.float32)
-                        logger.warning("  Extra obs '%s' has %d/%d frames, forward-filled", name, len(values), frame_count)
-                    elif creator is not None and name in extra_obs_config:
-                        # Zero-fill: feature is in schema (from earlier episode) but absent this episode
-                        shape = tuple(extra_obs_config[name]["shape"])
-                        extra_obs_arrays[name] = np.zeros((frame_count, *shape), dtype=np.float32)
-                        logger.warning("  Extra obs '%s' has 0/%d frames, zero-filled", name, frame_count)
-                del extra_obs_lists
-
-                # Filter extra_obs_config to only features actually collected
-                # (prevents schema/frame mismatch)
-                extra_obs_config = {k: v for k, v in extra_obs_config.items() if k in extra_obs_arrays}
 
             # Trial-to-episode mapping for scoring.yaml
             trial_key = f"trial_{idx + 1}"
             scoring_meta = scoring_data.get(trial_key, {})
             episode_success = scoring_meta.get("success", False)
 
+            # Track extra_obs last-known values for forward-fill
+            extra_obs_last = {}  # name -> last np.array
+            extra_obs_counts = {name: 0 for name in extra_obs_config} if extra_obs_config else {}
 
-            # --- Initialize DataCreator ---
-            if creator is None:
-                creator_kwargs = dict(
-                    repo_id=repo_id,
-                    root=output_root,
-                    robot_type=config.robot_type,
-                    action_order=config.action_order,
-                    joint_order=config.joint_order,
-                    camera_names=config.camera_names,
-                    fps=config.fps,
-                )
-                # Pass v2 schema extras only when configured
-                if extra_obs_config:
-                    creator_kwargs["extra_obs_config"] = extra_obs_config
-                if has_episode_signals:
-                    creator_kwargs["has_episode_signals"] = True
-                creator = DataCreator(**creator_kwargs)
-
-                append_mode = cfg.get("append", False)
-                dataset_root = Path(output_root)
-                local_exists = (dataset_root / "meta" / "info.json").is_file()
-
-                if append_mode and not local_exists and "/" in repo_id:
-                    # Pull existing dataset from HuggingFace to local path
-                    try:
-                        logger.info("Append mode: pulling existing dataset from Hub: %s", repo_id)
-                        from lerobot.datasets.lerobot_dataset import LeRobotDataset
-                        # Download to default cache, then copy to output_root
-                        tmp_ds = LeRobotDataset(repo_id=repo_id)
-                        cached_root = Path(tmp_ds.root)
-                        dataset_root.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copytree(str(cached_root), str(dataset_root))
-                        del tmp_ds
-                        local_exists = True
-                        logger.info("Pulled %s to %s", repo_id, dataset_root)
-                    except Exception as e:
-                        logger.warning("No existing dataset on Hub, creating new: %s", e)
-
-                if append_mode and local_exists:
-                    logger.info("Append mode: loading existing dataset (%d episodes)",
-                                creator.dataset.meta.total_episodes if creator.dataset else 0)
-                    creator.load_dataset()
-                    logger.info("Loaded existing dataset with %d episodes",
-                                creator.dataset.meta.total_episodes)
-                else:
-                    # Build a minimal episode dict for create_dataset shape inference
-                    dummy_episode = {
-                        "obs": obs_array[:1],
-                        "images": {cam: [img] for cam, img in (first_frame_images or {}).items()},
-                        "task": task_instruction,
-                    }
-                    for key in config.action_order:
-                        dummy_episode[key] = actions_by_key[key][:1]
-                    creator.create_dataset(dummy_episode)
-
-            if creator.dataset.episode_buffer is None or "size" not in creator.dataset.episode_buffer:
-                creator.dataset.episode_buffer = creator.dataset.create_episode_buffer()
-
-            # --- Pass 2: stream images + write frames ---
-            logger.info("  Pass 2: streaming %d frames to dataset...", frame_count)
-            frame_idx = 0
+            frame_count = 0
             for frame in extract_frames_iter(
                 bag_path=str(mcap_path), config=config,
             ):
+                obs = np.asarray(frame["obs"], dtype=np.float32)
+                action = np.concatenate(
+                    [np.asarray(frame["action"][key], dtype=np.float32) for key in config.action_order],
+                    axis=-1,
+                ).astype(np.float32)
+
+                # --- Initialize DataCreator on first frame of first episode ---
+                if creator is None:
+                    creator_kwargs = dict(
+                        repo_id=repo_id,
+                        root=output_root,
+                        robot_type=config.robot_type,
+                        action_order=config.action_order,
+                        joint_order=config.joint_order,
+                        camera_names=config.camera_names,
+                        fps=config.fps,
+                    )
+                    if extra_obs_config:
+                        creator_kwargs["extra_obs_config"] = extra_obs_config
+                    if has_episode_signals:
+                        creator_kwargs["has_episode_signals"] = True
+                    creator = DataCreator(**creator_kwargs)
+
+                    append_mode = cfg.get("append", False)
+                    dataset_root = Path(output_root)
+                    local_exists = (dataset_root / "meta" / "info.json").is_file()
+
+                    if append_mode and not local_exists and "/" in repo_id:
+                        try:
+                            logger.info("Append mode: pulling existing dataset from Hub: %s", repo_id)
+                            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+                            tmp_ds = LeRobotDataset(repo_id=repo_id)
+                            cached_root = Path(tmp_ds.root)
+                            dataset_root.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copytree(str(cached_root), str(dataset_root))
+                            del tmp_ds
+                            local_exists = True
+                            logger.info("Pulled %s to %s", repo_id, dataset_root)
+                        except Exception as e:
+                            logger.warning("No existing dataset on Hub, creating new: %s", e)
+
+                    if append_mode and local_exists:
+                        logger.info("Append mode: loading existing dataset")
+                        creator.load_dataset()
+                        logger.info("Loaded existing dataset with %d episodes",
+                                    creator.dataset.meta.total_episodes)
+                    else:
+                        first_frame_images = {
+                            cam: frame["images"][cam]
+                            for cam in config.camera_names
+                            if cam in frame["images"]
+                        }
+                        dummy_episode = {
+                            "obs": obs[np.newaxis],
+                            "images": {cam: [img] for cam, img in first_frame_images.items()},
+                            "task": task_instruction,
+                        }
+                        for key in config.action_order:
+                            dummy_episode[key] = np.asarray(frame["action"][key], dtype=np.float32)[np.newaxis]
+                        creator.create_dataset(dummy_episode)
+
+                if frame_count == 0:
+                    if creator.dataset.episode_buffer is None or "size" not in creator.dataset.episode_buffer:
+                        creator.dataset.episode_buffer = creator.dataset.create_episode_buffer()
+
+                # Build lerobot frame
                 lerobot_frame = {
-                    "observation.state": obs_array[frame_idx],
-                    "action": all_actions[frame_idx],
+                    "observation.state": obs,
+                    "action": action,
                 }
                 for cam in config.camera_names:
                     if cam in frame["images"]:
                         lerobot_frame[f"observation.images.{cam}"] = frame["images"][cam]
-                # Add extra observations
-                for name, arr in extra_obs_arrays.items():
-                    if frame_idx < len(arr):
-                        lerobot_frame[f"observation.{name}"] = arr[frame_idx]
-                # Add episode signals (LeRobot expects np.ndarray, not scalars)
+
+                # Extra observations with inline forward-fill
+                if extra_obs_config and "extra_obs" in frame:
+                    for name in extra_obs_config:
+                        if name in frame["extra_obs"]:
+                            val = np.asarray(frame["extra_obs"][name], dtype=np.float32)
+                            extra_obs_last[name] = val
+                            extra_obs_counts[name] += 1
+                        # Use last-known value (forward-fill) or zeros
+                        if name in extra_obs_last:
+                            lerobot_frame[f"observation.{name}"] = extra_obs_last[name]
+                        elif name in extra_obs_config:
+                            shape = tuple(extra_obs_config[name]["shape"])
+                            lerobot_frame[f"observation.{name}"] = np.zeros(shape, dtype=np.float32)
+                elif extra_obs_config:
+                    # No extra_obs in frame at all — use last known or zeros
+                    for name in extra_obs_config:
+                        if name in extra_obs_last:
+                            lerobot_frame[f"observation.{name}"] = extra_obs_last[name]
+                        else:
+                            shape = tuple(extra_obs_config[name]["shape"])
+                            lerobot_frame[f"observation.{name}"] = np.zeros(shape, dtype=np.float32)
+
+                # Episode signals
+                # Note: done/success set conservatively; patched after loop if needed
                 if has_episode_signals:
-                    lerobot_frame["next.done"] = np.array([frame_idx == frame_count - 1], dtype=bool)
-                    lerobot_frame["next.success"] = np.array([(frame_idx == frame_count - 1) and episode_success], dtype=bool)
+                    lerobot_frame["next.done"] = np.array([False], dtype=bool)
+                    lerobot_frame["next.success"] = np.array([False], dtype=bool)
+
                 lerobot_frame["task"] = task_instruction
                 creator.dataset.add_frame(lerobot_frame)
 
-                frame_idx += 1
-                if frame_idx % 500 == 0:
-                    logger.info("    Written %d/%d frames", frame_idx, frame_count)
+                frame_count += 1
+                if frame_count % 500 == 0:
+                    logger.info("    Streamed %d frames", frame_count)
+
+            if frame_count == 0:
+                raise ValueError(
+                    f"No frames extracted [folder={folder_name}] from {mcap_path}."
+                )
+
+            # Log extra_obs stats
+            if extra_obs_config:
+                for name, cnt in extra_obs_counts.items():
+                    if cnt < frame_count:
+                        logger.warning("  extra_obs '%s': %d/%d frames, forward-filled", name, cnt, frame_count)
+                    else:
+                        logger.info("  extra_obs '%s': %d/%d frames", name, cnt, frame_count)
+
+            # Patch last frame's done/success signals
+            if has_episode_signals and frame_count > 0:
+                buf = creator.dataset.episode_buffer
+                buf["next.done"][-1] = np.array([True], dtype=bool)
+                buf["next.success"][-1] = np.array([episode_success], dtype=bool)
 
             creator.dataset.save_episode()
-            logger.info("  Episode saved: %d frames", frame_idx)
-            del obs_array, all_actions, actions_by_key, extra_obs_arrays
+            logger.info("  Episode saved: %d frames (single-pass)", frame_count)
 
             # Skip the old convert_episode path
             episode = None
@@ -688,10 +655,14 @@ def run_conversion(config_path: str) -> int:
     # Finalize dataset
     if creator is not None and creator.dataset is not None:
         try:
+            used_streaming = getattr(creator.dataset, '_streaming_encoder', None) is not None
             creator.dataset.finalize()
             logger.info("Dataset finalized")
-            creator.correct_video_timestamps()
-            logger.info("Video timestamps corrected")
+            if not used_streaming:
+                creator.correct_video_timestamps()
+                logger.info("Video timestamps corrected")
+            else:
+                logger.info("Streaming encoder used — skipping timestamp correction")
             creator.patch_episodes_metadata()
             logger.info("Episode custom metadata patched")
         except Exception as e:

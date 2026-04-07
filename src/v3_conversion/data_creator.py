@@ -68,7 +68,11 @@ class DataCreator:
         self.dataset = LeRobotDataset(
             repo_id=self.repo_id,
             root=str(dataset_root),
+            vcodec="h264",
+            streaming_encoding=True,
         )
+        if self.dataset._streaming_encoder is not None:
+            self.dataset._streaming_encoder.g = 10
         self.dataset.start_image_writer(
             num_processes=0,
             num_threads=4,
@@ -153,7 +157,11 @@ class DataCreator:
             image_writer_processes=0,
             image_writer_threads=4,
             batch_encoding_size=1,
+            vcodec="h264",
+            streaming_encoding=True,
         )
+        if self.dataset._streaming_encoder is not None:
+            self.dataset._streaming_encoder.g = 10
 
     def convert_episode(self, episode: Dict[str, Any], custom_metadata: dict | None = None) -> None:
 
