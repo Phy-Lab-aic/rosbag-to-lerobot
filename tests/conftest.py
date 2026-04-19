@@ -5,7 +5,6 @@ from typing import Any, Dict
 
 import numpy as np
 import pytest
-from mcap.writer import Writer as McapWriter
 from mcap_ros2.writer import Writer as Ros2Writer
 
 
@@ -56,19 +55,29 @@ def build_mcap_fixture(tmp_path: Path):
     ) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
-            writer = Ros2Writer(McapWriter(f))
+            writer = Ros2Writer(f)
 
             if joint_states:
+                joint_state_msgdef = (
+                    "std_msgs/Header header\nstring[] name\n"
+                    "float64[] position\nfloat64[] velocity\nfloat64[] effort\n"
+                    "===\n"
+                    "MSG: std_msgs/Header\n"
+                    "builtin_interfaces/Time stamp\n"
+                    "string frame_id\n"
+                    "===\n"
+                    "MSG: builtin_interfaces/Time\n"
+                    "uint32 sec\n"
+                    "uint32 nanosec"
+                )
+                joint_state_schema = writer.register_msgdef(
+                    datatype="sensor_msgs/msg/JointState",
+                    msgdef_text=joint_state_msgdef,
+                )
                 for t_ns, names, positions in joint_states:
                     writer.write_message(
                         topic="/joint_states",
-                        schema=writer.register_msgdef(
-                            datatype="sensor_msgs/msg/JointState",
-                            msgdef_text=(
-                                "std_msgs/Header header\nstring[] name\n"
-                                "float64[] position\nfloat64[] velocity\nfloat64[] effort"
-                            ),
-                        ),
+                        schema=joint_state_schema,
                         message={
                             "header": {
                                 "stamp": {
