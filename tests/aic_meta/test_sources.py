@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from v3_conversion.aic_meta.sources import (
+    load_episode_metadata,
+    load_scene_from_config,
     load_run_meta,
     load_scoring_yaml,
     load_tags,
@@ -84,3 +86,77 @@ def test_load_scoring_yaml_extracts_categories(tmp_path: Path):
     assert result["score_insertion_force_message"] == "No excessive force detected"
     assert result["score_traj_efficiency"] == pytest.approx(5.88)
     assert result["score_traj_smoothness_message"] == "jerk info"
+
+
+def test_load_episode_metadata_flattens_semantic_and_outcome(tmp_path: Path):
+    (tmp_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "episode_id": 0,
+                "cable_type": "sfp_sc",
+                "cable_name": "cable_0",
+                "plug_type": "sfp",
+                "plug_name": "sfp_tip",
+                "port_type": "sfp",
+                "port_name": "sfp_port_0",
+                "target_module": "nic_card_mount_0",
+                "success": True,
+                "early_terminated": True,
+                "early_term_source": "insertion_event",
+                "plug_port_distance": 0.001,
+                "num_steps": 286,
+                "duration_sec": 24.6827,
+            }
+        )
+    )
+
+    result = load_episode_metadata(tmp_path)
+
+    assert result["cable_type"] == "sfp_sc"
+    assert result["target_module"] == "nic_card_mount_0"
+    assert result["plug_port_distance_init"] == pytest.approx(0.001)
+    assert result["num_steps"] == 286
+
+
+def test_load_scene_from_config_extracts_rails_and_cable_pose(tmp_path: Path):
+    (tmp_path / "config.yaml").write_text(
+        textwrap.dedent(
+            """
+            trials:
+              trial_1:
+                scene:
+                  task_board:
+                    nic_rail_0:
+                      entity_present: true
+                      entity_name: nic_card_0
+                    nic_rail_1:
+                      entity_present: false
+                    sc_rail_0:
+                      entity_present: true
+                      entity_name: sc_mount_0
+                  cables:
+                    cable_0:
+                      pose:
+                        gripper_offset: {x: 0.0, y: 0.015385, z: 0.04245}
+                        roll: 0.4432
+                        pitch: -0.4838
+                        yaw: 1.3303
+            """
+        ).lstrip()
+    )
+
+    result = load_scene_from_config(tmp_path, trial_key="trial_1")
+
+    assert result["initial_plug_pose_rel_gripper"] == [
+        0.0,
+        0.015385,
+        0.04245,
+        0.4432,
+        -0.4838,
+        1.3303,
+    ]
+    rail_names = [r["name"] for r in result["scene_rails"]]
+    assert rail_names == ["nic_rail_0", "nic_rail_1", "sc_rail_0"]
+    assert result["scene_rails"][0]["entity_name"] == "nic_card_0"
+    assert result["scene_rails"][1]["entity_present"] is False
+    assert result["scene_rails"][1]["entity_name"] == ""

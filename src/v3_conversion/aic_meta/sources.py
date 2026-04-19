@@ -32,6 +32,29 @@ _CATEGORY_COLUMNS = {
     ),
 }
 
+_METADATA_MAP = {
+    "cable_type": "cable_type",
+    "cable_name": "cable_name",
+    "plug_type": "plug_type",
+    "plug_name": "plug_name",
+    "port_type": "port_type",
+    "port_name": "port_name",
+    "target_module": "target_module",
+    "success": "success",
+    "early_terminated": "early_terminated",
+    "early_term_source": "early_term_source",
+    "num_steps": "num_steps",
+    "duration_sec": "duration_sec",
+}
+
+_RAIL_PATTERNS = (
+    "nic_rail_",
+    "sc_rail_",
+    "lc_mount_rail_",
+    "sfp_mount_rail_",
+    "sc_mount_rail_",
+)
+
 
 def load_run_meta(run_dir: Path) -> Dict[str, Any]:
     """Read policy.txt and seed.txt from a run directory.
@@ -99,5 +122,89 @@ def load_scoring_yaml(trial_dir: Path, trial_key: str) -> Dict[str, Any]:
         cat = categories.get(cat_key) or {}
         result[score_col] = float(cat.get("score", float("nan")))
         result[msg_col] = str(cat.get("message", ""))
+
+    return result
+
+
+def load_episode_metadata(episode_dir: Path) -> Dict[str, Any]:
+    """Read episode/metadata.json into a flat subset for the meta schema."""
+    path = episode_dir / "metadata.json"
+    defaults: Dict[str, Any] = {
+        "cable_type": "",
+        "cable_name": "",
+        "plug_type": "",
+        "plug_name": "",
+        "port_type": "",
+        "port_name": "",
+        "target_module": "",
+        "success": False,
+        "early_terminated": False,
+        "early_term_source": "",
+        "num_steps": 0,
+        "duration_sec": 0.0,
+        "plug_port_distance_init": float("nan"),
+    }
+    if not path.is_file():
+        return defaults
+
+    with path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    result = dict(defaults)
+    for src, dst in _METADATA_MAP.items():
+        if src in raw:
+            result[dst] = raw[src]
+    if "plug_port_distance" in raw:
+        result["plug_port_distance_init"] = float(raw["plug_port_distance"])
+    return result
+
+
+def _is_rail_key(key: str) -> bool:
+    return any(key.startswith(pattern) for pattern in _RAIL_PATTERNS)
+
+
+def load_scene_from_config(run_dir: Path, trial_key: str) -> Dict[str, Any]:
+    """Read config.yaml and extract rails + cable initial pose (gripper frame)."""
+    path = run_dir / "config.yaml"
+    result: Dict[str, Any] = {
+        "scene_rails": [],
+        "initial_plug_pose_rel_gripper": [0.0] * 6,
+    }
+    if not path.is_file():
+        return result
+
+    with path.open("r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    trial = (raw.get("trials") or {}).get(trial_key) or {}
+    scene = trial.get("scene") or {}
+
+    task_board = scene.get("task_board") or {}
+    rails: list[Dict[str, Any]] = []
+    for name, val in task_board.items():
+        if not _is_rail_key(name) or not isinstance(val, dict):
+            continue
+        rails.append(
+            {
+                "name": name,
+                "entity_present": bool(val.get("entity_present", False)),
+                "entity_name": str(val.get("entity_name", "")),
+            }
+        )
+    result["scene_rails"] = rails
+
+    cables = scene.get("cables") or {}
+    first_cable = next(iter(cables.values()), None) if cables else None
+    if isinstance(first_cable, dict):
+        pose = first_cable.get("pose") or {}
+        offset = pose.get("gripper_offset") or {}
+        result["initial_plug_pose_rel_gripper"] = [
+            float(offset.get("x", 0.0)),
+            float(offset.get("y", 0.0)),
+            float(offset.get("z", 0.0)),
+            float(pose.get("roll", 0.0)),
+            float(pose.get("pitch", 0.0)),
+            float(pose.get("yaw", 0.0)),
+        ]
 
     return result
