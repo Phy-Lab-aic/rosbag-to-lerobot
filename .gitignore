@@ -20,7 +20,6 @@ install/
 log/
 certs/
 src/dataset_manager/
-tests/
 amd64/
 arm64/
 
