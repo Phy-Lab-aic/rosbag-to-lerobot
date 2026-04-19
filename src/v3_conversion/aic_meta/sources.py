@@ -47,15 +47,6 @@ _METADATA_MAP = {
     "duration_sec": "duration_sec",
 }
 
-_RAIL_PATTERNS = (
-    "nic_rail_",
-    "sc_rail_",
-    "lc_mount_rail_",
-    "sfp_mount_rail_",
-    "sc_mount_rail_",
-)
-
-
 def load_run_meta(run_dir: Path) -> Dict[str, Any]:
     """Read policy.txt and seed.txt from a run directory.
 
@@ -160,7 +151,7 @@ def load_episode_metadata(episode_dir: Path) -> Dict[str, Any]:
 
 
 def _is_rail_key(key: str) -> bool:
-    return any(key.startswith(pattern) for pattern in _RAIL_PATTERNS)
+    return "rail_" in key
 
 
 def load_scene_from_config(run_dir: Path, trial_key: str) -> Dict[str, Any]:
@@ -194,9 +185,9 @@ def load_scene_from_config(run_dir: Path, trial_key: str) -> Dict[str, Any]:
     result["scene_rails"] = rails
 
     cables = scene.get("cables") or {}
-    first_cable = next(iter(cables.values()), None) if cables else None
-    if isinstance(first_cable, dict):
-        pose = first_cable.get("pose") or {}
+    cable_0 = cables.get("cable_0") if isinstance(cables, dict) else None
+    if isinstance(cable_0, dict):
+        pose = cable_0.get("pose") or {}
         offset = pose.get("gripper_offset") or {}
         result["initial_plug_pose_rel_gripper"] = [
             float(offset.get("x", 0.0)),

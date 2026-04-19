@@ -160,3 +160,80 @@ def test_load_scene_from_config_extracts_rails_and_cable_pose(tmp_path: Path):
     assert result["scene_rails"][0]["entity_name"] == "nic_card_0"
     assert result["scene_rails"][1]["entity_present"] is False
     assert result["scene_rails"][1]["entity_name"] == ""
+
+
+def test_load_scene_from_config_selects_cable_0_not_first_cable(tmp_path: Path):
+    (tmp_path / "config.yaml").write_text(
+        textwrap.dedent(
+            """
+            trials:
+              trial_1:
+                scene:
+                  task_board:
+                    nic_rail_0:
+                      entity_present: true
+                  cables:
+                    cable_1:
+                      pose:
+                        gripper_offset: {x: 1.0, y: 2.0, z: 3.0}
+                        roll: 4.0
+                        pitch: 5.0
+                        yaw: 6.0
+                    cable_0:
+                      pose:
+                        gripper_offset: {x: 0.0, y: 0.1, z: 0.2}
+                        roll: 0.3
+                        pitch: 0.4
+                        yaw: 0.5
+            """
+        ).lstrip()
+    )
+
+    result = load_scene_from_config(tmp_path, trial_key="trial_1")
+
+    assert result["initial_plug_pose_rel_gripper"] == [
+        0.0,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+    ]
+
+
+def test_load_scene_from_config_keeps_broader_rail_slots_in_order(tmp_path: Path):
+    (tmp_path / "config.yaml").write_text(
+        textwrap.dedent(
+            """
+            trials:
+              trial_1:
+                scene:
+                  task_board:
+                    nic_rail_0:
+                      entity_present: true
+                      entity_name: nic_card_0
+                    custom_rail_0:
+                      entity_present: true
+                      entity_name: custom_mount_0
+                    sc_rail_0:
+                      entity_present: true
+                      entity_name: sc_mount_0
+                  cables:
+                    cable_0:
+                      pose:
+                        gripper_offset: {x: 0.0, y: 0.0, z: 0.0}
+                        roll: 0.0
+                        pitch: 0.0
+                        yaw: 0.0
+            """
+        ).lstrip()
+    )
+
+    result = load_scene_from_config(tmp_path, trial_key="trial_1")
+
+    assert [rail["name"] for rail in result["scene_rails"]] == [
+        "nic_rail_0",
+        "custom_rail_0",
+        "sc_rail_0",
+    ]
+    assert result["scene_rails"][1]["entity_name"] == "custom_mount_0"
