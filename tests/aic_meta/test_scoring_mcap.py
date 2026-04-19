@@ -148,3 +148,91 @@ def test_scoring_tf_snapshots_capture_initial_and_final(
     final_frames = {f["frame_id"]: f for f in result["scoring_frames_final"]}
     assert final_frames["task_board"]["parent_frame_id"] == "world"
     assert final_frames["nic_card_mount_0"]["pose"][0] == pytest.approx(0.03)
+
+
+def test_scoring_tf_snapshots_return_empty_for_unreadable_bag(tmp_path: Path):
+    bag = tmp_path / "broken.mcap"
+    bag.write_bytes(b"not a valid mcap file")
+
+    result = extract_scoring_tf_snapshots(bag)
+
+    assert result == {"scoring_frames_initial": [], "scoring_frames_final": []}
+
+
+def test_scoring_tf_snapshots_skip_missing_decoder(
+    build_mcap_fixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    bag = build_mcap_fixture(
+        path=tmp_path / "bag.mcap",
+        scoring_tf=[
+            (
+                0,
+                [
+                    (
+                        "world",
+                        "task_board",
+                        0.15,
+                        -0.20,
+                        1.14,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    )
+                ],
+            )
+        ],
+    )
+
+    class FakeFactory:
+        def decoder_for(self, message_encoding, schema):
+            return None
+
+    from v3_conversion.aic_meta import scoring_mcap
+
+    monkeypatch.setattr(scoring_mcap, "DecoderFactory", lambda: FakeFactory())
+
+    result = extract_scoring_tf_snapshots(bag)
+
+    assert result == {"scoring_frames_initial": [], "scoring_frames_final": []}
+
+
+def test_scoring_tf_snapshots_skip_decode_failure(
+    build_mcap_fixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    bag = build_mcap_fixture(
+        path=tmp_path / "bag.mcap",
+        scoring_tf=[
+            (
+                0,
+                [
+                    (
+                        "world",
+                        "task_board",
+                        0.15,
+                        -0.20,
+                        1.14,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    )
+                ],
+            )
+        ],
+    )
+
+    class FakeFactory:
+        def decoder_for(self, message_encoding, schema):
+            def _decode(_data):
+                raise ValueError("boom")
+
+            return _decode
+
+    from v3_conversion.aic_meta import scoring_mcap
+
+    monkeypatch.setattr(scoring_mcap, "DecoderFactory", lambda: FakeFactory())
+
+    result = extract_scoring_tf_snapshots(bag)
+
+    assert result == {"scoring_frames_initial": [], "scoring_frames_final": []}

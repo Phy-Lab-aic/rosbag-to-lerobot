@@ -1,17 +1,44 @@
 """Shared pytest fixtures for the rosbag-to-lerobot test suite."""
 
 from pathlib import Path
+import os
 from typing import Any, Dict
+from glob import glob
 
 import numpy as np
 import pytest
 from mcap_ros2.writer import Writer as Ros2Writer
 
+def _candidate_ros_share_dirs() -> list[Path]:
+    candidates: list[Path] = []
+    prefixes = []
+    for env_var in ("AMENT_PREFIX_PATH", "COLCON_PREFIX_PATH"):
+        prefixes.extend(
+            Path(entry)
+            for entry in os.environ.get(env_var, "").split(os.pathsep)
+            if entry
+        )
+    ros_distro = os.environ.get("ROS_DISTRO")
+    if ros_distro:
+        prefixes.append(Path("/opt/ros") / ros_distro)
+    prefixes.extend(Path(path) for path in sorted(glob("/opt/ros/*")))
+
+    seen: set[Path] = set()
+    for prefix in prefixes:
+        share_dir = prefix / "share"
+        if share_dir.exists() and share_dir not in seen:
+            seen.add(share_dir)
+            candidates.append(share_dir)
+    return candidates
+
 
 def _load_ros2_msgdef(datatype: str) -> str:
     package, _, name = datatype.partition("/msg/")
-    msg_path = Path("/opt/ros/jazzy/share") / package / "msg" / f"{name}.msg"
-    return msg_path.read_text()
+    for share_dir in _candidate_ros_share_dirs():
+        msg_path = share_dir / package / "msg" / f"{name}.msg"
+        if msg_path.exists():
+            return msg_path.read_text()
+    raise FileNotFoundError(f"Unable to locate ROS msg definition for {datatype}")
 
 
 def _build_tf_message_msgdef() -> str:

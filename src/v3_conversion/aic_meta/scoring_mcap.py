@@ -1,7 +1,8 @@
 """Per-episode extractors for /scoring/* MCAP topics."""
 
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Deque, Dict
 
 from mcap.stream_reader import StreamReader
 from mcap_ros2.decoder import DecoderFactory
@@ -11,6 +12,11 @@ _DEFAULT_RESULT = {
     "insertion_event_fired": False,
     "insertion_event_target": "",
     "insertion_event_time_sec": float("nan"),
+}
+
+_EMPTY_SCORING_TF_RESULT = {
+    "scoring_frames_initial": [],
+    "scoring_frames_final": [],
 }
 
 
@@ -69,28 +75,35 @@ def _collect_tf_messages(bag_path: Path):
     channels: dict[int, Any] = {}
     decoders: dict[int, Any] = {}
 
-    with open(bag_path, "rb") as f:
-        for record in StreamReader(f, record_size_limit=None).records:
-            rtype = type(record).__name__
-            if rtype == "Schema":
-                schemas[record.id] = record
-            elif rtype == "Channel":
-                channels[record.id] = record
-            elif rtype == "Message":
-                ch = channels.get(record.channel_id)
-                if not ch or ch.topic != "/scoring/tf":
-                    continue
-                sc = schemas.get(ch.schema_id)
-                if not sc:
-                    continue
-                if record.channel_id not in decoders:
-                    decoders[record.channel_id] = factory.decoder_for(
-                        ch.message_encoding, sc
-                    )
-                dec = decoders.get(record.channel_id)
-                if dec is None:
-                    continue
-                yield record.log_time, dec(record.data)
+    try:
+        with open(bag_path, "rb") as f:
+            for record in StreamReader(f, record_size_limit=None).records:
+                rtype = type(record).__name__
+                if rtype == "Schema":
+                    schemas[record.id] = record
+                elif rtype == "Channel":
+                    channels[record.id] = record
+                elif rtype == "Message":
+                    ch = channels.get(record.channel_id)
+                    if not ch or ch.topic != "/scoring/tf":
+                        continue
+                    sc = schemas.get(ch.schema_id)
+                    if not sc:
+                        continue
+                    if record.channel_id not in decoders:
+                        decoders[record.channel_id] = factory.decoder_for(
+                            ch.message_encoding, sc
+                        )
+                    dec = decoders.get(record.channel_id)
+                    if dec is None:
+                        continue
+                    try:
+                        msg = dec(record.data)
+                    except Exception:
+                        continue
+                    yield record.log_time, msg
+    except Exception:
+        return
 
 
 def _transform_to_row(transform) -> Dict[str, Any]:
@@ -115,25 +128,33 @@ def extract_scoring_tf_snapshots(
     bag_path: Path, window_ns: int = 1_000_000_000
 ) -> Dict[str, Any]:
     """Assemble initial/final snapshots from ``/scoring/tf`` traffic."""
-    messages: List[tuple[int, Any]] = list(_collect_tf_messages(bag_path))
-    if not messages:
-        return {"scoring_frames_initial": [], "scoring_frames_final": []}
-
-    first_t = messages[0][0]
-    last_t = messages[-1][0]
-    initial_cutoff = first_t + window_ns
-    final_cutoff = last_t - window_ns
-
+    first_t: int | None = None
+    initial_cutoff: int | None = None
     initial_map: Dict[str, Dict[str, Any]] = {}
-    final_map: Dict[str, Dict[str, Any]] = {}
+    trailing_window: Deque[tuple[int, list[Dict[str, Any]]]] = deque()
 
-    for t_ns, msg in messages:
-        for transform in msg.transforms:
-            row = _transform_to_row(transform)
-            if t_ns <= initial_cutoff:
+    for t_ns, msg in _collect_tf_messages(bag_path):
+        if first_t is None:
+            first_t = t_ns
+            initial_cutoff = t_ns + window_ns
+
+        rows = [_transform_to_row(transform) for transform in msg.transforms]
+        if initial_cutoff is not None and t_ns <= initial_cutoff:
+            for row in rows:
                 initial_map[row["frame_id"]] = row
-            if t_ns >= final_cutoff:
-                final_map[row["frame_id"]] = row
+
+        trailing_window.append((t_ns, rows))
+        final_cutoff = t_ns - window_ns
+        while trailing_window and trailing_window[0][0] < final_cutoff:
+            trailing_window.popleft()
+
+    if first_t is None:
+        return dict(_EMPTY_SCORING_TF_RESULT)
+
+    final_map: Dict[str, Dict[str, Any]] = {}
+    for _, rows in trailing_window:
+        for row in rows:
+            final_map[row["frame_id"]] = row
 
     return {
         "scoring_frames_initial": list(initial_map.values()),
