@@ -159,6 +159,18 @@ def test_scoring_tf_snapshots_return_empty_for_unreadable_bag(tmp_path: Path):
     assert result == {"scoring_frames_initial": [], "scoring_frames_final": []}
 
 
+def test_scoring_tf_snapshots_return_fresh_empty_lists_per_call(tmp_path: Path):
+    bag = tmp_path / "broken.mcap"
+    bag.write_bytes(b"not a valid mcap file")
+
+    first = extract_scoring_tf_snapshots(bag)
+    first["scoring_frames_initial"].append({"frame_id": "mutated"})
+
+    second = extract_scoring_tf_snapshots(bag)
+
+    assert second == {"scoring_frames_initial": [], "scoring_frames_final": []}
+
+
 def test_scoring_tf_snapshots_skip_missing_decoder(
     build_mcap_fixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

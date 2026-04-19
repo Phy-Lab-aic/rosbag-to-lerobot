@@ -14,10 +14,8 @@ _DEFAULT_RESULT = {
     "insertion_event_time_sec": float("nan"),
 }
 
-_EMPTY_SCORING_TF_RESULT = {
-    "scoring_frames_initial": [],
-    "scoring_frames_final": [],
-}
+def _empty_scoring_tf_result() -> Dict[str, Any]:
+    return {"scoring_frames_initial": [], "scoring_frames_final": []}
 
 
 def extract_insertion_event(
@@ -149,7 +147,7 @@ def extract_scoring_tf_snapshots(
             trailing_window.popleft()
 
     if first_t is None:
-        return dict(_EMPTY_SCORING_TF_RESULT)
+        return _empty_scoring_tf_result()
 
     final_map: Dict[str, Dict[str, Any]] = {}
     for _, rows in trailing_window:
