@@ -94,6 +94,18 @@ def build_mcap_fixture(tmp_path: Path):
                         log_time=t_ns,
                         publish_time=t_ns,
                     )
+            if insertion_event:
+                for t_ns, data in insertion_event:
+                    writer.write_message(
+                        topic="/scoring/insertion_event",
+                        schema=writer.register_msgdef(
+                            datatype="std_msgs/msg/String",
+                            msgdef_text="string data",
+                        ),
+                        message={"data": data},
+                        log_time=t_ns,
+                        publish_time=t_ns,
+                    )
             # wrench, images, insertion_event, scoring_tf similarly — expand in tasks that need them
             writer.finish()
         return path
