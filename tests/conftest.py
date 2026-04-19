@@ -56,6 +56,7 @@ def build_mcap_fixture(tmp_path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
             writer = Ros2Writer(f)
+            string_schema = None
 
             if joint_states:
                 joint_state_msgdef = (
@@ -95,13 +96,14 @@ def build_mcap_fixture(tmp_path: Path):
                         publish_time=t_ns,
                     )
             if insertion_event:
+                string_schema = string_schema or writer.register_msgdef(
+                    datatype="std_msgs/msg/String",
+                    msgdef_text="string data",
+                )
                 for t_ns, data in insertion_event:
                     writer.write_message(
                         topic="/scoring/insertion_event",
-                        schema=writer.register_msgdef(
-                            datatype="std_msgs/msg/String",
-                            msgdef_text="string data",
-                        ),
+                        schema=string_schema,
                         message={"data": data},
                         log_time=t_ns,
                         publish_time=t_ns,
