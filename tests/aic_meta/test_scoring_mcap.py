@@ -4,7 +4,10 @@ import math
 
 import pytest
 
-from v3_conversion.aic_meta.scoring_mcap import extract_insertion_event
+from v3_conversion.aic_meta.scoring_mcap import (
+    extract_insertion_event,
+    extract_scoring_tf_snapshots,
+)
 
 
 def test_extract_insertion_event_returns_default_for_unreadable_bag(tmp_path: Path):
@@ -106,3 +109,42 @@ def test_extract_insertion_event_skips_decode_failure(
     assert result["insertion_event_fired"] is False
     assert result["insertion_event_target"] == ""
     assert math.isnan(result["insertion_event_time_sec"])
+
+
+def test_scoring_tf_snapshots_capture_initial_and_final(
+    build_mcap_fixture, tmp_path: Path
+):
+    initial_tf = (
+        0,
+        [
+            ("world", "task_board", 0.15, -0.20, 1.14, 0.0, 0.0, 0.0, 1.0),
+            ("task_board", "nic_card_mount_0", 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        ],
+    )
+    mid_tf = (
+        500_000_000,
+        [
+            ("task_board", "nic_card_mount_0", 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        ],
+    )
+    final_tf = (
+        10_000_000_000,
+        [
+            ("world", "task_board", 0.15, -0.20, 1.14, 0.0, 0.0, 0.0, 1.0),
+            ("task_board", "nic_card_mount_0", 0.03, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        ],
+    )
+    bag = build_mcap_fixture(
+        path=tmp_path / "bag.mcap",
+        scoring_tf=[initial_tf, mid_tf, final_tf],
+    )
+
+    result = extract_scoring_tf_snapshots(bag, window_ns=1_000_000_000)
+
+    initial_frames = {f["frame_id"]: f for f in result["scoring_frames_initial"]}
+    assert "task_board" in initial_frames
+    assert initial_frames["nic_card_mount_0"]["pose"][0] == pytest.approx(0.02)
+
+    final_frames = {f["frame_id"]: f for f in result["scoring_frames_final"]}
+    assert final_frames["task_board"]["parent_frame_id"] == "world"
+    assert final_frames["nic_card_mount_0"]["pose"][0] == pytest.approx(0.03)

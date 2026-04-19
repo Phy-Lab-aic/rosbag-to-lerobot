@@ -8,6 +8,42 @@ import pytest
 from mcap_ros2.writer import Writer as Ros2Writer
 
 
+def _load_ros2_msgdef(datatype: str) -> str:
+    package, _, name = datatype.partition("/msg/")
+    msg_path = Path("/opt/ros/jazzy/share") / package / "msg" / f"{name}.msg"
+    return msg_path.read_text()
+
+
+def _build_tf_message_msgdef() -> str:
+    definitions = [
+        ("tf2_msgs/msg/TFMessage", _load_ros2_msgdef("tf2_msgs/msg/TFMessage")),
+        (
+            "geometry_msgs/msg/TransformStamped",
+            _load_ros2_msgdef("geometry_msgs/msg/TransformStamped"),
+        ),
+        ("std_msgs/msg/Header", _load_ros2_msgdef("std_msgs/msg/Header")),
+        (
+            "builtin_interfaces/msg/Time",
+            _load_ros2_msgdef("builtin_interfaces/msg/Time"),
+        ),
+        ("geometry_msgs/msg/Transform", _load_ros2_msgdef("geometry_msgs/msg/Transform")),
+        ("geometry_msgs/msg/Vector3", _load_ros2_msgdef("geometry_msgs/msg/Vector3")),
+        (
+            "geometry_msgs/msg/Quaternion",
+            _load_ros2_msgdef("geometry_msgs/msg/Quaternion"),
+        ),
+    ]
+    return "\n================================================\n".join(
+        [
+            definitions[0][1],
+            *[
+                f"MSG: {datatype}\n{msgdef}"
+                for datatype, msgdef in definitions[1:]
+            ],
+        ]
+    )
+
+
 @pytest.fixture
 def tmp_dataset_root(tmp_path: Path) -> Path:
     """Empty directory that acts as a LeRobot dataset root."""
@@ -57,6 +93,7 @@ def build_mcap_fixture(tmp_path: Path):
         with open(path, "wb") as f:
             writer = Ros2Writer(f)
             string_schema = None
+            tf_schema = None
 
             if joint_states:
                 joint_state_msgdef = (
@@ -105,6 +142,42 @@ def build_mcap_fixture(tmp_path: Path):
                         topic="/scoring/insertion_event",
                         schema=string_schema,
                         message={"data": data},
+                        log_time=t_ns,
+                        publish_time=t_ns,
+                    )
+            if scoring_tf:
+                tf_schema = tf_schema or writer.register_msgdef(
+                    datatype="tf2_msgs/msg/TFMessage",
+                    msgdef_text=_build_tf_message_msgdef(),
+                )
+                for t_ns, transforms in scoring_tf:
+                    tf_msgs = []
+                    for parent, child, x, y, z, qx, qy, qz, qw in transforms:
+                        tf_msgs.append(
+                            {
+                                "header": {
+                                    "stamp": {
+                                        "sec": t_ns // 1_000_000_000,
+                                        "nanosec": t_ns % 1_000_000_000,
+                                    },
+                                    "frame_id": parent,
+                                },
+                                "child_frame_id": child,
+                                "transform": {
+                                    "translation": {"x": x, "y": y, "z": z},
+                                    "rotation": {
+                                        "x": qx,
+                                        "y": qy,
+                                        "z": qz,
+                                        "w": qw,
+                                    },
+                                },
+                            }
+                        )
+                    writer.write_message(
+                        topic="/scoring/tf",
+                        schema=tf_schema,
+                        message={"transforms": tf_msgs},
                         log_time=t_ns,
                         publish_time=t_ns,
                     )
