@@ -71,6 +71,51 @@ def _build_tf_message_msgdef() -> str:
     )
 
 
+def _build_wrench_stamped_msgdef() -> str:
+    definitions = [
+        (
+            "geometry_msgs/msg/WrenchStamped",
+            _load_ros2_msgdef("geometry_msgs/msg/WrenchStamped"),
+        ),
+        ("std_msgs/msg/Header", _load_ros2_msgdef("std_msgs/msg/Header")),
+        (
+            "builtin_interfaces/msg/Time",
+            _load_ros2_msgdef("builtin_interfaces/msg/Time"),
+        ),
+        ("geometry_msgs/msg/Wrench", _load_ros2_msgdef("geometry_msgs/msg/Wrench")),
+        ("geometry_msgs/msg/Vector3", _load_ros2_msgdef("geometry_msgs/msg/Vector3")),
+    ]
+    return "\n================================================\n".join(
+        [
+            definitions[0][1],
+            *[
+                f"MSG: {datatype}\n{msgdef}"
+                for datatype, msgdef in definitions[1:]
+            ],
+        ]
+    )
+
+
+def _build_image_msgdef() -> str:
+    definitions = [
+        ("sensor_msgs/msg/Image", _load_ros2_msgdef("sensor_msgs/msg/Image")),
+        ("std_msgs/msg/Header", _load_ros2_msgdef("std_msgs/msg/Header")),
+        (
+            "builtin_interfaces/msg/Time",
+            _load_ros2_msgdef("builtin_interfaces/msg/Time"),
+        ),
+    ]
+    return "\n================================================\n".join(
+        [
+            definitions[0][1],
+            *[
+                f"MSG: {datatype}\n{msgdef}"
+                for datatype, msgdef in definitions[1:]
+            ],
+        ]
+    )
+
+
 @pytest.fixture
 def tmp_dataset_root(tmp_path: Path) -> Path:
     """Empty directory that acts as a LeRobot dataset root."""
@@ -208,7 +253,65 @@ def build_mcap_fixture(tmp_path: Path):
                         log_time=t_ns,
                         publish_time=t_ns,
                     )
-            # wrench, images, insertion_event, scoring_tf similarly — expand in tasks that need them
+            if wrench:
+                wrench_schema = writer.register_msgdef(
+                    datatype="geometry_msgs/msg/WrenchStamped",
+                    msgdef_text=_build_wrench_stamped_msgdef(),
+                )
+                for t_ns, fx, fy, fz, tx, ty, tz in wrench:
+                    writer.write_message(
+                        topic="/fts_broadcaster/wrench",
+                        schema=wrench_schema,
+                        message={
+                            "header": {
+                                "stamp": {
+                                    "sec": t_ns // 1_000_000_000,
+                                    "nanosec": t_ns % 1_000_000_000,
+                                },
+                                "frame_id": "tool_link",
+                            },
+                            "wrench": {
+                                "force": {"x": fx, "y": fy, "z": fz},
+                                "torque": {"x": tx, "y": ty, "z": tz},
+                            },
+                        },
+                        log_time=t_ns,
+                        publish_time=t_ns,
+                    )
+            if images:
+                image_schema = writer.register_msgdef(
+                    datatype="sensor_msgs/msg/Image",
+                    msgdef_text=_build_image_msgdef(),
+                )
+                ordered_image_frames = []
+                for topic_rank, topic in enumerate(reversed(list(images.keys()))):
+                    for t_ns, height, width, data_bytes in images[topic]:
+                        ordered_image_frames.append(
+                            (t_ns, topic_rank, topic, height, width, data_bytes)
+                        )
+                ordered_image_frames.sort(key=lambda item: (item[0], item[1]))
+                for t_ns, _, topic, height, width, data_bytes in ordered_image_frames:
+                    writer.write_message(
+                        topic=topic,
+                        schema=image_schema,
+                        message={
+                            "header": {
+                                "stamp": {
+                                    "sec": t_ns // 1_000_000_000,
+                                    "nanosec": t_ns % 1_000_000_000,
+                                },
+                                "frame_id": "camera",
+                            },
+                            "height": height,
+                            "width": width,
+                            "encoding": "rgb8",
+                            "is_bigendian": 0,
+                            "step": width * 3,
+                            "data": list(data_bytes),
+                        },
+                        log_time=t_ns,
+                        publish_time=t_ns,
+                    )
             writer.finish()
         return path
 

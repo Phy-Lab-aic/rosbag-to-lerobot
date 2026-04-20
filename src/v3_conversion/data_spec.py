@@ -19,3 +19,4 @@ class Rosbag:
     robot_type: str = ""
     # Action canonical names whose source topic equals state_topic
     shared_action_names: List[str] = field(default_factory=list)
+    wrench_topic: str = ""
