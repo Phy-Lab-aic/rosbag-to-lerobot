@@ -12,9 +12,24 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from v3_conversion.action_shift import apply_one_step_shift
-from v3_conversion.aic_meta.sources import load_episode_metadata
+from v3_conversion.aic_meta.scoring_mcap import (
+    extract_insertion_event,
+    extract_scoring_tf_snapshots,
+)
+from v3_conversion.aic_meta.sources import (
+    load_episode_metadata,
+    load_run_meta,
+    load_scene_from_config,
+    load_scoring_yaml,
+    load_tags,
+)
 from v3_conversion.aic_meta.task_string import build_task_string
-
+from v3_conversion.aic_meta.writer import (
+    write_scene_parquet,
+    write_scoring_parquet,
+    write_task_parquet,
+    write_tf_snapshots_parquet,
+)
 from v3_conversion.constants import CONFIG_PATH, INPUT_PATH, OUTPUT_PATH
 from v3_conversion.data_converter import frames_to_episode
 from v3_conversion.data_creator import DataCreator
@@ -256,6 +271,10 @@ def run_conversion(config_path: str) -> int:
     converted_count = 0
     failed_count = 0
     failed_folders: List[str] = []
+    aic_task_rows: List[Dict[str, Any]] = []
+    aic_scoring_rows: List[Dict[str, Any]] = []
+    aic_scene_rows: List[Dict[str, Any]] = []
+    aic_tf_rows: List[Dict[str, Any]] = []
 
     for idx, folder_name in enumerate(folders):
         logger.info("[%d/%d] Converting: %s", idx + 1, len(folders), folder_name)
@@ -337,6 +356,59 @@ def run_conversion(config_path: str) -> int:
 
             creator.convert_episode(episode)
 
+            run_dir = INPUT_PATH / folder_name
+            trial_key = trial_dir.name.split("_score")[0]  # "trial_1_score95" -> "trial_1"
+            run_meta = load_run_meta(run_dir)
+            tags_meta = load_tags(trial_dir)
+            scoring_meta = load_scoring_yaml(trial_dir, trial_key=trial_key)
+            scene_meta = load_scene_from_config(run_dir, trial_key=trial_key)
+            episode_start_ns = int(timestamps.get(
+                config.camera_names[0] if config.camera_names else "observation", [0]
+            )[0])
+            insertion_meta = extract_insertion_event(
+                mcap_path, episode_start_ns=episode_start_ns,
+            )
+            tf_snapshots = extract_scoring_tf_snapshots(mcap_path)
+
+            ep_idx = creator.dataset.meta.total_episodes - 1
+
+            aic_task_rows.append({
+                "episode_index": ep_idx,
+                "run_folder": folder_name,
+                "trial_key": trial_key,
+                "trial_score_folder": trial_dir.name,
+                "schema_version": tags_meta["schema_version"],
+                "cable_type": episode_meta["cable_type"],
+                "cable_name": episode_meta["cable_name"],
+                "plug_type": episode_meta["plug_type"],
+                "plug_name": episode_meta["plug_name"],
+                "port_type": episode_meta["port_type"],
+                "port_name": episode_meta["port_name"],
+                "target_module": episode_meta["target_module"],
+                "success": bool(episode_meta["success"]),
+                "early_terminated": bool(episode_meta["early_terminated"]),
+                "early_term_source": episode_meta["early_term_source"],
+                "duration_sec": float(episode_meta["duration_sec"]),
+                "num_steps": int(episode_meta["num_steps"]),
+                "policy": run_meta["policy"],
+                "seed": int(run_meta["seed"]),
+                **insertion_meta,
+            })
+            aic_scoring_rows.append({"episode_index": ep_idx, **scoring_meta})
+            aic_scene_rows.append({
+                "episode_index": ep_idx,
+                "plug_port_distance_init": float(
+                    episode_meta["plug_port_distance_init"]
+                ),
+                "initial_plug_pose_rel_gripper":
+                    scene_meta["initial_plug_pose_rel_gripper"],
+                "scene_rails": scene_meta["scene_rails"],
+            })
+            aic_tf_rows.append({
+                "episode_index": ep_idx,
+                **tf_snapshots,
+            })
+            del timestamps
 
             converted_count += 1
             logger.info("  Converted successfully: %s", folder_name)
@@ -362,6 +434,11 @@ def run_conversion(config_path: str) -> int:
             logger.info("Video timestamps corrected")
             creator.patch_episodes_metadata()
             logger.info("Episode custom metadata patched")
+            aic_dir = Path(output_root) / "meta" / "aic"
+            write_task_parquet(aic_dir / "task.parquet", aic_task_rows)
+            write_scoring_parquet(aic_dir / "scoring.parquet", aic_scoring_rows)
+            write_scene_parquet(aic_dir / "scene.parquet", aic_scene_rows)
+            write_tf_snapshots_parquet(aic_dir / "tf_snapshots.parquet", aic_tf_rows)
         except Exception as e:
             logger.error("Failed to finalize dataset: %s", e)
 
