@@ -37,6 +37,21 @@ def _mk_bag(build_mcap_fixture, tmp_path):
     )
 
 
+def _pixel_frame(value):
+    return bytes([value, value, value])
+
+
+def _mk_sync_images(cam_times_by_topic):
+    h, w = 1, 1
+    images = {}
+    for topic, times in cam_times_by_topic.items():
+        frames = []
+        for idx, t_ns in enumerate(times):
+            frames.append((t_ns, h, w, _pixel_frame(10 + idx)))
+        images[topic] = frames
+    return images
+
+
 def test_extract_frames_camera_grid_three_frames(build_mcap_fixture, tmp_path):
     bag = _mk_bag(build_mcap_fixture, tmp_path)
     config = Rosbag(
@@ -60,3 +75,115 @@ def test_extract_frames_camera_grid_three_frames(build_mcap_fixture, tmp_path):
         assert frame["obs"].shape == (7,)
         assert frame["wrench"].shape == (6,)
         assert set(frame["images"]) == {"cam_left", "cam_center", "cam_right"}
+
+
+def test_extract_frames_requires_all_cameras_on_same_tick(build_mcap_fixture, tmp_path):
+    bag = build_mcap_fixture(
+        path=tmp_path / "lagging_camera.mcap",
+        joint_states=[(i * 2_000_000, JOINTS, [i * 0.001] * 7) for i in range(80)],
+        wrench=[(i * 20_000_000, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6) for i in range(10)],
+        images=_mk_sync_images(
+            {
+                "/left_camera/image": [0, 50_000_000, 100_000_000],
+                "/center_camera/image": [0, 100_000_000],
+                "/right_camera/image": [0, 100_000_000],
+            }
+        ),
+    )
+    config = Rosbag(
+        topic_map={
+            "/left_camera/image": "cam_left",
+            "/center_camera/image": "cam_center",
+            "/right_camera/image": "cam_right",
+            "/joint_states": "observation",
+            "/fts_broadcaster/wrench": "wrench",
+        },
+        action_order=["action"],
+        joint_order={"obs": JOINTS, "action": {"action": JOINTS}},
+        camera_names=["cam_left", "cam_center", "cam_right"],
+        fps=20,
+        shared_action_names=["action"],
+        wrench_topic="/fts_broadcaster/wrench",
+    )
+
+    frames, _ = extract_frames(bag_path=str(bag), config=config)
+
+    assert len(frames) == 2
+    assert [frame["images"]["cam_left"][0, 0, 0] for frame in frames] == [10, 12]
+    assert [frame["images"]["cam_center"][0, 0, 0] for frame in frames] == [10, 11]
+    assert [frame["images"]["cam_right"][0, 0, 0] for frame in frames] == [10, 11]
+
+
+def test_extract_frames_uses_dedicated_action_topics(build_mcap_fixture, tmp_path):
+    cam_times = [0, 50_000_000, 100_000_000]
+    bag = build_mcap_fixture(
+        path=tmp_path / "dedicated_action.mcap",
+        joint_states=[(i * 2_000_000, JOINTS, [i * 0.001] * 7) for i in range(80)],
+        joint_state_topics={
+            "/leader_joint_states": [
+                (t_ns, JOINTS, [0.5 + idx] * 7) for idx, t_ns in enumerate(cam_times)
+            ]
+        },
+        images=_mk_sync_images(
+            {
+                "/left_camera/image": cam_times,
+                "/center_camera/image": cam_times,
+                "/right_camera/image": cam_times,
+            }
+        ),
+    )
+    config = Rosbag(
+        topic_map={
+            "/left_camera/image": "cam_left",
+            "/center_camera/image": "cam_center",
+            "/right_camera/image": "cam_right",
+            "/joint_states": "observation",
+            "/leader_joint_states": "action",
+        },
+        action_order=["action"],
+        joint_order={"obs": JOINTS, "action": {"action": JOINTS}},
+        camera_names=["cam_left", "cam_center", "cam_right"],
+        fps=20,
+        shared_action_names=[],
+    )
+
+    frames, _ = extract_frames(bag_path=str(bag), config=config)
+
+    assert len(frames) == 3
+    assert [frame["action"]["action"][0] for frame in frames] == [0.5, 1.5, 2.5]
+
+
+def test_extract_frames_downsamples_primary_camera_to_config_fps(build_mcap_fixture, tmp_path):
+    cam_times = [0, 25_000_000, 50_000_000, 75_000_000, 100_000_000]
+    bag = build_mcap_fixture(
+        path=tmp_path / "fps_gated.mcap",
+        joint_states=[(i * 1_000_000, JOINTS, [i * 0.001] * 7) for i in range(120)],
+        wrench=[(i * 10_000_000, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6) for i in range(20)],
+        images=_mk_sync_images(
+            {
+                "/left_camera/image": cam_times,
+                "/center_camera/image": cam_times,
+                "/right_camera/image": cam_times,
+            }
+        ),
+    )
+    config = Rosbag(
+        topic_map={
+            "/left_camera/image": "cam_left",
+            "/center_camera/image": "cam_center",
+            "/right_camera/image": "cam_right",
+            "/joint_states": "observation",
+            "/fts_broadcaster/wrench": "wrench",
+        },
+        action_order=["action"],
+        joint_order={"obs": JOINTS, "action": {"action": JOINTS}},
+        camera_names=["cam_left", "cam_center", "cam_right"],
+        fps=20,
+        shared_action_names=["action"],
+        wrench_topic="/fts_broadcaster/wrench",
+    )
+
+    frames, _ = extract_frames(bag_path=str(bag), config=config)
+
+    assert len(frames) == 3
+    assert [round(float(frame["obs"][0]), 3) for frame in frames] == [0.0, 0.05, 0.1]

@@ -192,8 +192,11 @@ def extract_frames(
     topic_map = config.topic_map
     joint_order = config.joint_order
     camera_names = config.camera_names
+    fps = config.fps
     wrench_topic = getattr(config, "wrench_topic", "")
     shared_action_names = config.shared_action_names
+    required_action_names = set(joint_order.get("action", {}).keys())
+    dedicated_action_names = required_action_names.difference(shared_action_names)
 
     cam_topics_by_name = {
         canonical_name: topic
@@ -202,13 +205,18 @@ def extract_frames(
     }
     primary_cam_name = camera_names[0] if camera_names else None
     primary_cam_topic = cam_topics_by_name.get(primary_cam_name)
+    timegap = 1_000_000_000 // fps if fps > 0 else 0
+    ts_ref = -timegap if timegap else 0
 
     latest_joint_msg = None
     latest_joint_schema = ""
     latest_wrench_msg = None
     latest_wrench_schema = ""
+    latest_action_msg: dict[str, Any] = {}
+    latest_action_schema: dict[str, str] = {}
     latest_cam_msg = {cam: None for cam in camera_names}
     latest_cam_schema = {cam: "" for cam in camera_names}
+    latest_cam_t_ns = {cam: None for cam in camera_names}
 
     frames: List[Dict[str, Any]] = []
     timestamps: dict[str, list[int]] = {v: [] for v in topic_map.values()}
@@ -232,16 +240,24 @@ def extract_frames(
         elif canonical in camera_names:
             latest_cam_msg[canonical] = msg
             latest_cam_schema[canonical] = schema_name
+            latest_cam_t_ns[canonical] = t_ns
         elif canonical == "action" or canonical.startswith("action_"):
-            continue
+            latest_action_msg[canonical] = msg
+            latest_action_schema[canonical] = schema_name
 
         if topic != primary_cam_topic:
             continue
+        if timegap:
+            if (t_ns - ts_ref) < timegap:
+                continue
+            ts_ref = t_ns if ts_ref < 0 else ts_ref + timegap
         if latest_joint_msg is None:
             continue
         if wrench_topic and latest_wrench_msg is None:
             continue
-        if any(v is None for v in latest_cam_msg.values()):
+        if any(latest_cam_t_ns[cam] != t_ns for cam in camera_names):
+            continue
+        if any(name not in latest_action_msg for name in dedicated_action_names):
             continue
 
         schema_map = {
@@ -251,7 +267,11 @@ def extract_frames(
         if wrench_topic:
             schema_map["wrench"] = latest_wrench_schema
 
-        leader_msgs = {}
+        leader_msgs = {
+            name: latest_action_msg[name] for name in dedicated_action_names
+        }
+        for name in dedicated_action_names:
+            schema_map[name] = latest_action_schema[name]
         for sa in shared_action_names:
             leader_msgs[sa] = latest_joint_msg
             schema_map[sa] = latest_joint_schema
