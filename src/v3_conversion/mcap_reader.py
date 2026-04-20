@@ -198,15 +198,8 @@ def extract_frames(
     required_action_names = set(joint_order.get("action", {}).keys())
     dedicated_action_names = required_action_names.difference(shared_action_names)
 
-    cam_topics_by_name = {
-        canonical_name: topic
-        for topic, canonical_name in topic_map.items()
-        if canonical_name in camera_names
-    }
     primary_cam_name = camera_names[0] if camera_names else None
-    primary_cam_topic = cam_topics_by_name.get(primary_cam_name)
     timegap = 1_000_000_000 // fps if fps > 0 else 0
-    ts_ref = -timegap if timegap else 0
 
     latest_joint_msg = None
     latest_joint_schema = ""
@@ -220,6 +213,7 @@ def extract_frames(
 
     frames: List[Dict[str, Any]] = []
     timestamps: dict[str, list[int]] = {v: [] for v in topic_map.values()}
+    last_emitted_tick_ns: int | None = None
     for sa in shared_action_names:
         timestamps[sa] = []
 
@@ -228,6 +222,7 @@ def extract_frames(
         if canonical is None:
             continue
         timestamps[canonical].append(t_ns)
+        camera_updated = False
 
         if canonical == "observation":
             latest_joint_msg = msg
@@ -241,21 +236,27 @@ def extract_frames(
             latest_cam_msg[canonical] = msg
             latest_cam_schema[canonical] = schema_name
             latest_cam_t_ns[canonical] = t_ns
+            camera_updated = True
         elif canonical == "action" or canonical.startswith("action_"):
             latest_action_msg[canonical] = msg
             latest_action_schema[canonical] = schema_name
 
-        if topic != primary_cam_topic:
+        if not camera_updated:
             continue
-        if timegap:
-            if (t_ns - ts_ref) < timegap:
+
+        primary_tick_ns = latest_cam_t_ns.get(primary_cam_name) if primary_cam_name else None
+        if primary_tick_ns is None:
+            continue
+        if last_emitted_tick_ns == primary_tick_ns:
+            continue
+        if timegap and last_emitted_tick_ns is not None:
+            if (primary_tick_ns - last_emitted_tick_ns) < timegap:
                 continue
-            ts_ref = t_ns if ts_ref < 0 else ts_ref + timegap
         if latest_joint_msg is None:
             continue
         if wrench_topic and latest_wrench_msg is None:
             continue
-        if any(latest_cam_t_ns[cam] != t_ns for cam in camera_names):
+        if any(latest_cam_t_ns[cam] != primary_tick_ns for cam in camera_names):
             continue
         if any(name not in latest_action_msg for name in dedicated_action_names):
             continue
@@ -287,6 +288,7 @@ def extract_frames(
         )
         if frame is not None:
             frames.append(frame)
+            last_emitted_tick_ns = primary_tick_ns
 
     return frames, timestamps
 

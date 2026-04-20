@@ -1,5 +1,5 @@
 from v3_conversion.data_spec import Rosbag
-from v3_conversion.mcap_reader import extract_frames
+from v3_conversion.mcap_reader import build_extraction_config, extract_frames
 
 
 JOINTS = [
@@ -187,3 +187,37 @@ def test_extract_frames_downsamples_primary_camera_to_config_fps(build_mcap_fixt
 
     assert len(frames) == 3
     assert [round(float(frame["obs"][0]), 3) for frame in frames] == [0.0, 0.05, 0.1]
+
+
+def test_extract_frames_emits_when_non_primary_camera_closes_tick(
+    build_mcap_fixture, tmp_path
+):
+    cam_times = [0, 50_000_000, 100_000_000]
+    bag = build_mcap_fixture(
+        path=tmp_path / "non_primary_closes_tick.mcap",
+        joint_states=[(i * 2_000_000, JOINTS, [i * 0.001] * 7) for i in range(80)],
+        images={
+            "/cam_b/image": [(t, 1, 1, _pixel_frame(20 + idx)) for idx, t in enumerate(cam_times)],
+            "/cam_c/image": [(t, 1, 1, _pixel_frame(30 + idx)) for idx, t in enumerate(cam_times)],
+            "/cam_a/image": [(t, 1, 1, _pixel_frame(10 + idx)) for idx, t in enumerate(cam_times)],
+        },
+    )
+    config = build_extraction_config(
+        detail={
+            "camera_topic_map": {
+                "cam_a": "/cam_a/image",
+                "cam_b": "/cam_b/image",
+                "cam_c": "/cam_c/image",
+            },
+            "joint_names": JOINTS,
+            "action_topics_map": {"leader": "/joint_states"},
+            "state_topic": "/joint_states",
+        },
+        fps=20,
+        robot_type="",
+    )
+
+    frames, _ = extract_frames(bag_path=str(bag), config=config)
+
+    assert len(frames) == 3
+    assert [frame["images"]["cam_a"][0, 0, 0] for frame in frames] == [10, 11, 12]
