@@ -11,6 +11,10 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from v3_conversion.action_shift import apply_one_step_shift
+from v3_conversion.aic_meta.sources import load_episode_metadata
+from v3_conversion.aic_meta.task_string import build_task_string
+
 from v3_conversion.constants import CONFIG_PATH, INPUT_PATH, OUTPUT_PATH
 from v3_conversion.data_converter import frames_to_episode
 from v3_conversion.data_creator import DataCreator
@@ -312,11 +316,15 @@ def run_conversion(config_path: str) -> int:
                     f"(missing leader topics or action key mismatch)."
                 )
 
-            # 7. Transform to episode (with task_instruction extraction)
-            task_instruction = "default_task"
-            ti = metadata.get("task_instruction")
-            if ti and isinstance(ti, list) and len(ti) > 0 and ti[0]:
-                task_instruction = ti[0]
+            # 7. Transform to episode with task derived from episode metadata
+            trial_candidates = sorted((INPUT_PATH / folder_name).glob("trial_*"))
+            if not trial_candidates:
+                raise FileNotFoundError(
+                    f"No trial_* directory under {INPUT_PATH / folder_name}"
+                )
+            trial_dir = trial_candidates[0]
+            episode_meta = load_episode_metadata(trial_dir / "episode")
+            task_instruction = build_task_string(episode_meta)
 
             episode = frames_to_episode(
                 frames=frames,
@@ -324,6 +332,8 @@ def run_conversion(config_path: str) -> int:
                 camera_names=config.camera_names,
                 task=task_instruction,
             )
+            del frames
+            episode = apply_one_step_shift(episode)
 
             creator.convert_episode(episode)
 
