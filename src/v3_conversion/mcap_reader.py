@@ -287,6 +287,7 @@ def extract_frames(
             wrench_msg=latest_wrench_msg if wrench_topic else None,
         )
         if frame is not None:
+            frame["emitted_timestamp_ns"] = int(primary_tick_ns)
             frames.append(frame)
             last_emitted_tick_ns = primary_tick_ns
 

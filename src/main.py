@@ -2,14 +2,22 @@
 
 Replaces ConversionNode (ROS2 Action Server) with a standalone Python script.
 Reads JSON config, iterates folders, and produces LeRobot v3 datasets.
+
+Supports two modes:
+  - Convert:  python main.py config.json --input-dir /bags --output-dir /out
+  - Merge:    python main.py config.json --input-dir /bags --output-dir /existing/dataset --merge
 """
 
+import argparse
+import gc
 import json
 import logging
 import sys
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import pyarrow.parquet as pq
 
 from v3_conversion.action_shift import apply_one_step_shift
 from v3_conversion.aic_meta.scoring_mcap import (
@@ -43,6 +51,13 @@ from v3_conversion.mcap_reader import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = CONFIG_PATH
+
+
+def _load_existing_parquet_rows(path: Path) -> List[Dict[str, Any]]:
+    """Read existing parquet rows so merge mode appends instead of overwriting."""
+    if not path.is_file():
+        return []
+    return pq.read_table(path).to_pylist()
 
 
 # ------------------------------------------------------------------
@@ -93,6 +108,7 @@ def _load_config(config_path: str) -> dict:
         "camera_topic_map": config.get("camera_topic_map", {}),
         "joint_names": config.get("joint_names", []),
         "state_topic": config.get("state_topic", ""),
+        "wrench_topic": config.get("wrench_topic", ""),
         "action_topics_map": config.get("action_topics_map", {}),
         "task_instruction": config.get("task_instruction", []),
         "tags": config.get("tags", []),
@@ -141,6 +157,7 @@ def _load_metacard(
         "joint_names": metacard.get("joint_names", defaults.get("joint_names", [])),
         "action_topics_map": metacard.get("action_topics_map", defaults.get("action_topics_map", {})),
         "state_topic": metacard.get("state_topic", defaults.get("state_topic", "")),
+        "wrench_topic": metacard.get("wrench_topic", defaults.get("wrench_topic", "")),
     }
 
 
@@ -236,11 +253,33 @@ def _prepare_config(
 # Main conversion
 # ------------------------------------------------------------------
 
-def run_conversion(config_path: str) -> int:
+def run_conversion(
+    config_path: str,
+    input_dir: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    merge: bool = False,
+) -> int:
     """Run the full conversion pipeline.
+
+    Parameters
+    ----------
+    input_dir : str, optional
+        Override INPUT_PATH (where bag folders live).
+    output_dir : str, optional
+        Override OUTPUT_PATH.  When *merge* is True this must point to an
+        existing LeRobot dataset directory.
+    merge : bool
+        When True, use *output_dir* as-is (no task_name subdirectory) and
+        append episodes to the existing dataset found there.
 
     Returns exit code: 0=success, 1=all failed, 2=partial success.
     """
+    global INPUT_PATH
+    if input_dir is not None:
+        INPUT_PATH = Path(input_dir)
+
+    effective_output = Path(output_dir) if output_dir else OUTPUT_PATH
+
     cfg = _load_config(config_path)
     task_name = cfg["task_name"]
     repo_id = cfg["repo_id"] or task_name
@@ -255,6 +294,7 @@ def run_conversion(config_path: str) -> int:
         "camera_topic_map": cfg.get("camera_topic_map", {}),
         "joint_names": cfg.get("joint_names", []),
         "state_topic": cfg.get("state_topic", ""),
+        "wrench_topic": cfg.get("wrench_topic", ""),
         "action_topics_map": cfg.get("action_topics_map", {}),
         "task_instruction": cfg.get("task_instruction", []),
         "tags": cfg.get("tags", []),
@@ -264,17 +304,60 @@ def run_conversion(config_path: str) -> int:
         logger.error("No folders to convert")
         return 1
 
-    logger.info("Starting conversion: task=%s, folders=%d", task_name, len(folders))
+    next_episode_index = 0
+    if merge:
+        output_root = str(effective_output)
+        meta_info = effective_output / "meta" / "info.json"
+        if not meta_info.is_file():
+            logger.error(
+                "Merge target is not an existing LeRobot dataset: %s "
+                "(meta/info.json not found)", effective_output,
+            )
+            return 1
 
-    output_root = str(OUTPUT_PATH / task_name)
+        with open(meta_info, "r", encoding="utf-8") as _f:
+            existing_info = json.load(_f)
+        existing_features = existing_info.get("features", {})
+        existing_obs_shape = existing_features.get("observation.state", {}).get("shape", [])
+        config_obs_dim = len(config_defaults["joint_names"])
+
+        if existing_obs_shape and existing_obs_shape[0] != config_obs_dim:
+            logger.error(
+                "Feature mismatch: existing dataset has observation.state shape %s "
+                "but config has %d joints (%s). "
+                "Adjust joint_names in config to match.",
+                existing_obs_shape, config_obs_dim, config_defaults["joint_names"],
+            )
+            return 1
+
+        next_episode_index = int(existing_info.get("total_episodes", 0))
+        logger.info(
+            "MERGE mode: appending to existing dataset at %s "
+            "(existing episodes=%s, fps=%s)",
+            output_root,
+            existing_info.get("total_episodes", "?"),
+            existing_info.get("fps", "?"),
+        )
+    else:
+        output_root = str(effective_output / task_name)
+
+    aic_dir = Path(output_root) / "meta" / "aic"
+
+    logger.info("Starting conversion: task=%s, folders=%d", task_name, len(folders))
     creator: Optional[DataCreator] = None
     converted_count = 0
     failed_count = 0
     failed_folders: List[str] = []
-    aic_task_rows: List[Dict[str, Any]] = []
-    aic_scoring_rows: List[Dict[str, Any]] = []
-    aic_scene_rows: List[Dict[str, Any]] = []
-    aic_tf_rows: List[Dict[str, Any]] = []
+    if merge:
+        aic_task_rows = _load_existing_parquet_rows(aic_dir / "task.parquet")
+        aic_scoring_rows = _load_existing_parquet_rows(aic_dir / "scoring.parquet")
+        aic_scene_rows = _load_existing_parquet_rows(aic_dir / "scene.parquet")
+        aic_tf_rows = _load_existing_parquet_rows(aic_dir / "tf_snapshots.parquet")
+    else:
+        aic_task_rows = []
+        aic_scoring_rows = []
+        aic_scene_rows = []
+        aic_tf_rows = []
 
     for idx, folder_name in enumerate(folders):
         logger.info("[%d/%d] Converting: %s", idx + 1, len(folders), folder_name)
@@ -345,34 +428,27 @@ def run_conversion(config_path: str) -> int:
             episode_meta = load_episode_metadata(trial_dir / "episode")
             task_instruction = build_task_string(episode_meta)
 
-            episode = frames_to_episode(
-                frames=frames,
-                action_order=config.action_order,
-                camera_names=config.camera_names,
-                task=task_instruction,
-            )
-            del frames
-            episode = apply_one_step_shift(episode)
-
-            creator.convert_episode(episode)
-
             run_dir = INPUT_PATH / folder_name
             trial_key = trial_dir.name.split("_score")[0]  # "trial_1_score95" -> "trial_1"
             run_meta = load_run_meta(run_dir)
             tags_meta = load_tags(trial_dir)
             scoring_meta = load_scoring_yaml(trial_dir, trial_key=trial_key)
             scene_meta = load_scene_from_config(run_dir, trial_key=trial_key)
-            episode_start_ns = int(timestamps.get(
-                config.camera_names[0] if config.camera_names else "observation", [0]
-            )[0])
+            episode_start_ns = int(
+                frames[0].get(
+                    "emitted_timestamp_ns",
+                    timestamps.get(
+                        config.camera_names[0] if config.camera_names else "observation",
+                        [0],
+                    )[0],
+                )
+            )
             insertion_meta = extract_insertion_event(
                 mcap_path, episode_start_ns=episode_start_ns,
             )
             tf_snapshots = extract_scoring_tf_snapshots(mcap_path)
-
-            ep_idx = creator.dataset.meta.total_episodes - 1
-
-            aic_task_rows.append({
+            ep_idx = next_episode_index
+            task_row = {
                 "episode_index": ep_idx,
                 "run_folder": folder_name,
                 "trial_key": trial_key,
@@ -393,9 +469,9 @@ def run_conversion(config_path: str) -> int:
                 "policy": run_meta["policy"],
                 "seed": int(run_meta["seed"]),
                 **insertion_meta,
-            })
-            aic_scoring_rows.append({"episode_index": ep_idx, **scoring_meta})
-            aic_scene_rows.append({
+            }
+            scoring_row = {"episode_index": ep_idx, **scoring_meta}
+            scene_row = {
                 "episode_index": ep_idx,
                 "plug_port_distance_init": float(
                     episode_meta["plug_port_distance_init"]
@@ -403,15 +479,35 @@ def run_conversion(config_path: str) -> int:
                 "initial_plug_pose_rel_gripper":
                     scene_meta["initial_plug_pose_rel_gripper"],
                 "scene_rails": scene_meta["scene_rails"],
-            })
-            aic_tf_rows.append({
+            }
+            tf_row = {
                 "episode_index": ep_idx,
                 **tf_snapshots,
-            })
+            }
             del timestamps
+
+            # frames_to_episode consumes and clears the frames list
+            episode = frames_to_episode(
+                frames=frames,
+                action_order=config.action_order,
+                camera_names=config.camera_names,
+                task=task_instruction,
+            )
+            del frames
+            episode = apply_one_step_shift(episode)
+
+            # 8. Convert episode
+            creator.convert_episode(episode)
+            del episode
+            aic_task_rows.append(task_row)
+            aic_scoring_rows.append(scoring_row)
+            aic_scene_rows.append(scene_row)
+            aic_tf_rows.append(tf_row)
+            next_episode_index += 1
 
             converted_count += 1
             logger.info("  Converted successfully: %s", folder_name)
+            gc.collect()
 
         except Exception as e:
             failed_count += 1
@@ -426,7 +522,9 @@ def run_conversion(config_path: str) -> int:
                     creator.dataset = None
 
     # Finalize dataset
+    finalize_failed = False
     if creator is not None and creator.dataset is not None:
+        finalize_ok = False
         try:
             creator.dataset.finalize()
             logger.info("Dataset finalized")
@@ -434,16 +532,21 @@ def run_conversion(config_path: str) -> int:
             logger.info("Video timestamps corrected")
             creator.patch_episodes_metadata()
             logger.info("Episode custom metadata patched")
-            aic_dir = Path(output_root) / "meta" / "aic"
             write_task_parquet(aic_dir / "task.parquet", aic_task_rows)
             write_scoring_parquet(aic_dir / "scoring.parquet", aic_scoring_rows)
             write_scene_parquet(aic_dir / "scene.parquet", aic_scene_rows)
             write_tf_snapshots_parquet(aic_dir / "tf_snapshots.parquet", aic_tf_rows)
+            finalize_ok = True
         except Exception as e:
-            logger.error("Failed to finalize dataset: %s", e)
+            finalize_failed = True
+            logger.error("Failed to finalize dataset or write AIC metadata: %s", e)
 
         # Push to HuggingFace Hub if repo_id has namespace format
-        if "/" in repo_id:
+        if not finalize_ok:
+            logger.warning(
+                "Skipping push_to_hub because dataset finalization or AIC metadata write failed."
+            )
+        elif "/" in repo_id:
             try:
                 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -468,7 +571,7 @@ def run_conversion(config_path: str) -> int:
 
     if converted_count == 0:
         return 1
-    if failed_count > 0:
+    if failed_count > 0 or finalize_failed:
         return 2
     return 0
 
@@ -479,8 +582,34 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    config_path = sys.argv[1] if len(sys.argv) > 1 else str(DEFAULT_CONFIG)
-    exit_code = run_conversion(config_path)
+    parser = argparse.ArgumentParser(
+        description="Convert MCAP ROS2 bags to LeRobot v3 dataset",
+    )
+    parser.add_argument(
+        "config", nargs="?", default=str(DEFAULT_CONFIG),
+        help="Path to config.json (default: src/config.json)",
+    )
+    parser.add_argument(
+        "--input-dir",
+        help="Directory containing bag folders (overrides INPUT_PATH env/default)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Output directory. In merge mode, must be an existing LeRobot dataset.",
+    )
+    parser.add_argument(
+        "--merge", action="store_true",
+        help="Append episodes to the existing dataset at --output-dir "
+             "(no task_name subdirectory created)",
+    )
+    args = parser.parse_args()
+
+    exit_code = run_conversion(
+        config_path=args.config,
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        merge=args.merge,
+    )
     sys.exit(exit_code)
 
 
