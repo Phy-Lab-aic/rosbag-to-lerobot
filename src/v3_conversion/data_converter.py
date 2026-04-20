@@ -232,6 +232,7 @@ def build_frame(
     joint_order: Dict[str, Any],
     rot_img: bool,
     schema_map: Dict[str, str],
+    wrench_msg: Any | None = None,
 ) -> Dict[str, Any] | None:
     """Convert accumulated deserialized messages into a single frame dict.
 
@@ -279,7 +280,11 @@ def build_frame(
             if "wrist" in k:
                 camera_data[k] = v[::-1, ::-1].copy()
 
-    return {"images": camera_data, "obs": follower_data, "action": action_data}
+    result = {"images": camera_data, "obs": follower_data, "action": action_data}
+    if wrench_msg is not None:
+        wrench_schema = schema_map.get("wrench", "geometry_msgs/msg/WrenchStamped")
+        result["wrench"] = _convert_joint_msg(wrench_msg, None, wrench_schema)
+    return result
 
 
 def frames_to_episode(
@@ -292,6 +297,8 @@ def frames_to_episode(
     obs_list = []
     action_lists = {key: [] for key in action_order}
     camera_lists = {cam: [] for cam in camera_names}
+    wrench_list: list = []
+    any_wrench = False
 
     for f in frames:
         obs_list.append(np.asarray(f["obs"], dtype=np.float32))
@@ -305,6 +312,11 @@ def frames_to_episode(
             if cam in imgs:
                 camera_lists[cam].append(imgs[cam])
 
+        if "wrench" in f:
+            wrench_list.append(np.asarray(f["wrench"], dtype=np.float32))
+            any_wrench = True
+
+
     episode = {
         "obs": np.stack(obs_list, axis=0),
         "images": camera_lists,
@@ -312,5 +324,9 @@ def frames_to_episode(
     }
     for key in action_order:
         episode[key] = np.stack(action_lists[key], axis=0)
+    del action_lists
+
+    if any_wrench:
+        episode["wrench"] = np.stack(wrench_list, axis=0)
 
     return episode
