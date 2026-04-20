@@ -174,6 +174,21 @@ class DataCreator:
                     f"Camera {cam_name} has {len(cam_list)} frames, expected {frame_count}"
                 )
 
+        dataset_has_wrench = "observation.wrench" in self.dataset.features
+        episode_has_wrench = "wrench" in episode
+        if dataset_has_wrench and not episode_has_wrench:
+            raise ValueError(
+                "Dataset expects observation.wrench but this episode does not provide wrench data."
+            )
+        if episode_has_wrench and not dataset_has_wrench:
+            raise ValueError(
+                "This episode provides wrench data but the dataset was created without observation.wrench."
+            )
+        if episode_has_wrench and len(episode["wrench"]) != frame_count:
+            raise ValueError(
+                f"Wrench has {len(episode['wrench'])} frames, expected {frame_count}"
+            )
+
         # Pre-compute expected image shapes for auto-resize (merge mode)
         expected_shapes: Dict[str, tuple] = {}
         for cam_name in self.camera_names:
