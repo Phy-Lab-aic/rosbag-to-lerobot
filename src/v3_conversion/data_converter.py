@@ -88,14 +88,14 @@ def _handle_controller_state(msg_data, joint_order: List[str]) -> np.ndarray:
         raise ValueError(
             f"ControllerState.reference_joint_state has {len(positions)} "
             f"positions but joint_order expects {len(joint_order)}"
-        )
+    )
     return np.array(positions, dtype=np.float32)
 
 
 def _handle_wrench_stamped(msg_data, joint_order) -> np.ndarray:
     """Handle geometry_msgs/msg/WrenchStamped -> [Fx,Fy,Fz,Tx,Ty,Tz]."""
     w = msg_data.wrench
-    return np.array(
+    result = np.array(
         [
             w.force.x,
             w.force.y,
@@ -298,9 +298,10 @@ def frames_to_episode(
     action_lists = {key: [] for key in action_order}
     camera_lists = {cam: [] for cam in camera_names}
     wrench_list: list = []
-    any_wrench = False
 
-    for f in frames:
+    # Pop frames from the input list to free memory as we consume them
+    while frames:
+        f = frames.pop(0)
         obs_list.append(np.asarray(f["obs"], dtype=np.float32))
 
         action = f["action"]
@@ -314,7 +315,8 @@ def frames_to_episode(
 
         if "wrench" in f:
             wrench_list.append(np.asarray(f["wrench"], dtype=np.float32))
-            any_wrench = True
+
+        f.clear()
 
     if wrench_list and len(wrench_list) != len(obs_list):
         raise ValueError(
@@ -322,17 +324,17 @@ def frames_to_episode(
             "or in none of them"
         )
 
-
     episode = {
         "obs": np.stack(obs_list, axis=0),
         "images": camera_lists,
         "task": task,
     }
+    del obs_list
     for key in action_order:
         episode[key] = np.stack(action_lists[key], axis=0)
     del action_lists
 
-    if any_wrench:
+    if wrench_list:
         episode["wrench"] = np.stack(wrench_list, axis=0)
 
     return episode
