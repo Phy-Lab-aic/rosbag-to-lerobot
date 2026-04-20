@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import av
+import cv2
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -50,6 +51,7 @@ class DataCreator:
         self.camera_names = camera_names
         self.dataset = None
         self._episode_custom_metadata: List[Dict[str, Any]] = []
+        self._existing_episode_count: int = 0
 
         if "v3" not in version:
             raise RuntimeError(
@@ -64,6 +66,7 @@ class DataCreator:
             repo_id=self.repo_id,
             root=str(dataset_root),
         )
+        self._existing_episode_count = self.dataset.meta.total_episodes
         self.dataset.start_image_writer(
             num_processes=0,
             num_threads=4,
@@ -91,6 +94,14 @@ class DataCreator:
                 "names": action_joint_names,
             },
         }
+
+        if "wrench" in episode:
+            wrench_dim = int(np.asarray(episode["wrench"]).shape[-1])
+            features["observation.wrench"] = {
+                "dtype": "float32",
+                "shape": (wrench_dim,),
+                "names": ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"][:wrench_dim],
+            }
 
         for cam_name in self.camera_names:
             if cam_name in episode["images"] and len(episode["images"][cam_name]) > 0:
@@ -163,20 +174,41 @@ class DataCreator:
                     f"Camera {cam_name} has {len(cam_list)} frames, expected {frame_count}"
                 )
 
+        # Pre-compute expected image shapes for auto-resize (merge mode)
+        expected_shapes: Dict[str, tuple] = {}
+        for cam_name in self.camera_names:
+            feat_key = f"observation.images.{cam_name}"
+            if feat_key in self.dataset.features:
+                feat_shape = self.dataset.features[feat_key]["shape"]
+                expected_shapes[cam_name] = (feat_shape[0], feat_shape[1])
+
         task = episode.get("task", "no_task_specified")
         for t in range(frame_count):
             frame = {
                 "observation.state": obs[t],
                 "action": actions[t],
             }
+            if "wrench" in episode:
+                frame["observation.wrench"] = np.asarray(
+                    episode["wrench"][t], dtype=np.float32
+                )
             for cam_name in self.camera_names:
                 if cam_name in camera_lists:
-                    frame[f"observation.images.{cam_name}"] = camera_lists[cam_name][t]
+                    img = camera_lists[cam_name][t]
+                    if cam_name in expected_shapes:
+                        exp_h, exp_w = expected_shapes[cam_name]
+                        if img.shape[0] != exp_h or img.shape[1] != exp_w:
+                            img = cv2.resize(img, (exp_w, exp_h), interpolation=cv2.INTER_AREA)
+                    frame[f"observation.images.{cam_name}"] = img
+                    # Release image reference to free memory
+                    camera_lists[cam_name][t] = None
 
             frame["task"] = task
             self.dataset.add_frame(frame)
 
         self.dataset.save_episode()
+        # Free episode data
+        del obs, actions, camera_lists
 
         if custom_metadata:
             self._episode_custom_metadata.append(custom_metadata)
@@ -390,7 +422,11 @@ class DataCreator:
             )
 
     def patch_episodes_metadata(self) -> None:
-        """Patch episodes parquet files with custom metadata after finalize()."""
+        """Patch episodes parquet files with custom metadata after finalize().
+
+        When merging into an existing dataset, only patches the newly added
+        episodes (skips pre-existing ones tracked by _existing_episode_count).
+        """
         if not self._episode_custom_metadata or not self.dataset:
             return
 
@@ -402,30 +438,64 @@ class DataCreator:
         if not parquet_files:
             return
 
-        row_offset = 0
+        # Build a flat list of (parquet_path, row_index_in_file, episode_index)
+        # then filter to only the newly added episodes.
+        skip = self._existing_episode_count
+        global_row = 0
         for pq_path in parquet_files:
             table = pq.read_table(pq_path)
             num_rows = table.num_rows
 
-            metadata_slice = self._episode_custom_metadata[
-                row_offset : row_offset + num_rows
-            ]
-            row_offset += num_rows
+            # Determine which rows in this file are new episodes
+            new_start = max(0, skip - global_row)
+            new_count = num_rows - new_start
+            global_row += num_rows
 
-            if not metadata_slice:
+            if new_count <= 0:
+                continue
+
+            # Map new rows to their custom metadata
+            meta_offset = max(0, global_row - num_rows - skip + new_start)
+            metadata_slice = self._episode_custom_metadata[
+                meta_offset : meta_offset + new_count
+            ]
+
+            if not metadata_slice or len(metadata_slice) != new_count:
+                logger.warning(
+                    "Metadata count mismatch for %s: expected %d, got %d. Skipping.",
+                    pq_path.name, new_count,
+                    len(metadata_slice) if metadata_slice else 0,
+                )
                 continue
 
             all_keys = set()
             for m in metadata_slice:
                 all_keys.update(m.keys())
 
+            if not all_keys:
+                continue
+
+            # If file has a mix of old and new rows, we need to preserve
+            # existing values for old rows and only set new ones.
             for key in all_keys:
-                values = [m.get(key, None) for m in metadata_slice]
-                if any(isinstance(v, list) for v in values):
-                    arrow_values = [v if v is not None else [] for v in values]
+                new_values = [m.get(key, None) for m in metadata_slice]
+                is_list_col = any(isinstance(v, list) for v in new_values)
+
+                if new_start > 0:
+                    # File has pre-existing rows: build full column
+                    if key in table.column_names:
+                        existing = table.column(key).to_pylist()[:new_start]
+                    else:
+                        existing = [[] if is_list_col else None] * new_start
+                    full_values = existing + new_values
+                else:
+                    full_values = new_values
+
+                if is_list_col:
+                    arrow_values = [v if v is not None else [] for v in full_values]
                     col = pa.array(arrow_values, type=pa.list_(pa.string()))
                 else:
-                    col = pa.array(values, type=pa.string())
+                    col = pa.array(full_values, type=pa.string())
 
                 if key in table.column_names:
                     idx = table.column_names.index(key)
