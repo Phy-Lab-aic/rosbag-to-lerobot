@@ -92,12 +92,29 @@ def _handle_controller_state(msg_data, joint_order: List[str]) -> np.ndarray:
     return np.array(positions, dtype=np.float32)
 
 
+def _handle_wrench_stamped(msg_data, joint_order) -> np.ndarray:
+    """Handle geometry_msgs/msg/WrenchStamped -> [Fx,Fy,Fz,Tx,Ty,Tz]."""
+    w = msg_data.wrench
+    return np.array(
+        [
+            w.force.x,
+            w.force.y,
+            w.force.z,
+            w.torque.x,
+            w.torque.y,
+            w.torque.z,
+        ],
+        dtype=np.float32,
+    )
+
+
 _JOINT_HANDLERS = {
     "trajectory_msgs/msg/JointTrajectory": _handle_joint_trajectory,
     "sensor_msgs/msg/JointState": _handle_joint_state,
     "nav_msgs/msg/Odometry": _handle_odometry,
     "geometry_msgs/msg/Twist": _handle_twist,
     "aic_control_interfaces/msg/ControllerState": _handle_controller_state,
+    "geometry_msgs/msg/WrenchStamped": _handle_wrench_stamped,
 }
 
 

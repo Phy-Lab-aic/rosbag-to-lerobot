@@ -237,7 +237,7 @@ def extract_frames(
             if not msg_flag[canonical_name]:
                 if canonical_name.startswith("cam_"):
                     image_msgs[canonical_name] = msg
-                elif canonical_name == "action" or canonical_name.startswith("action_"):
+                elif canonical_name == "action" or canonical_name.startswith("action_") or canonical_name == "wrench":
                     leader_msgs[canonical_name] = msg
                 elif canonical_name == "observation":
                     follower_msgs[canonical_name] = msg
@@ -257,7 +257,7 @@ def extract_frames(
         if not msg_flag[canonical_name]:
             if canonical_name.startswith("cam_"):
                 image_msgs[canonical_name] = msg
-            elif canonical_name == "action" or canonical_name.startswith("action_"):
+            elif canonical_name == "action" or canonical_name.startswith("action_") or canonical_name == "wrench":
                 leader_msgs[canonical_name] = msg
             elif canonical_name == "observation":
                 follower_msgs[canonical_name] = msg
