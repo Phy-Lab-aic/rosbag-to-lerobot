@@ -183,109 +183,113 @@ def extract_frames(
     config: Rosbag,
     rot_img: bool = False,
 ) -> Tuple[List[Dict[str, Any]], dict[str, list[int]]]:
-    """Extract synchronised frames from MCAP.
+    """Camera-timestamp-driven sync.
 
-    Returns ``(frames, timestamps)`` — Hz validation is the caller's
-    responsibility.
+    For every camera tick we keep the most recent joint_states and wrench.
+    A frame is emitted only when all cameras, observation, and (when
+    configured) wrench have at least one prior sample.
     """
     topic_map = config.topic_map
     joint_order = config.joint_order
     camera_names = config.camera_names
     fps = config.fps
-
+    wrench_topic = getattr(config, "wrench_topic", "")
     shared_action_names = config.shared_action_names
+    required_action_names = set(joint_order.get("action", {}).keys())
+    dedicated_action_names = required_action_names.difference(shared_action_names)
+
+    primary_cam_name = camera_names[0] if camera_names else None
+    timegap = 1_000_000_000 // fps if fps > 0 else 0
+
+    latest_joint_msg = None
+    latest_joint_schema = ""
+    latest_wrench_msg = None
+    latest_wrench_schema = ""
+    latest_action_msg: dict[str, Any] = {}
+    latest_action_schema: dict[str, str] = {}
+    latest_cam_msg = {cam: None for cam in camera_names}
+    latest_cam_schema = {cam: "" for cam in camera_names}
+    latest_cam_t_ns = {cam: None for cam in camera_names}
 
     frames: List[Dict[str, Any]] = []
-    timestamps: dict[str, list[int]] = {name: [] for name in topic_map.values()}
-    # Add timestamp tracking for shared actions (not in topic_map)
+    timestamps: dict[str, list[int]] = {v: [] for v in topic_map.values()}
+    last_emitted_tick_ns: int | None = None
     for sa in shared_action_names:
         timestamps[sa] = []
 
-    timegap = 1_000_000_000 // fps
-    ts_ref = -timegap
-    timing_source = camera_names[0] if camera_names else "observation"
+    for topic, msg, t_ns, schema_name in _read_rosbag_messages(bag_path):
+        canonical = topic_map.get(topic)
+        if canonical is None:
+            continue
+        timestamps[canonical].append(t_ns)
+        camera_updated = False
 
-    image_msgs: dict = {}
-    follower_msgs: dict = {}
-    leader_msgs: dict = {}
-    schema_map: dict[str, str] = {}
-    msg_flag = {name: False for name in topic_map.values()}
-    # Add flags for shared actions
-    for sa in shared_action_names:
-        msg_flag[sa] = False
-    cnt = 0
-    timing = False
+        if canonical == "observation":
+            latest_joint_msg = msg
+            latest_joint_schema = schema_name
+            for sa in shared_action_names:
+                timestamps[sa].append(t_ns)
+        elif canonical == "wrench":
+            latest_wrench_msg = msg
+            latest_wrench_schema = schema_name
+        elif canonical in camera_names:
+            latest_cam_msg[canonical] = msg
+            latest_cam_schema[canonical] = schema_name
+            latest_cam_t_ns[canonical] = t_ns
+            camera_updated = True
+        elif canonical == "action" or canonical.startswith("action_"):
+            latest_action_msg[canonical] = msg
+            latest_action_schema[canonical] = schema_name
 
-    for topic, msg, t, schema_name in _read_rosbag_messages(bag_path):
-        if topic not in topic_map:
+        if not camera_updated:
             continue
 
-        canonical_name = topic_map[topic]
-        timestamps[canonical_name].append(t)
-        schema_map[canonical_name] = schema_name
-
-        # Timing gate: only the timing source controls frame pacing.
-        # When the timing source arrives too early, skip *only that message*
-        # (not the entire loop iteration) so other topics are still collected.
-        if not timing and canonical_name == timing_source:
-            if (t - ts_ref) < timegap:
+        primary_tick_ns = latest_cam_t_ns.get(primary_cam_name) if primary_cam_name else None
+        if primary_tick_ns is None:
+            continue
+        if last_emitted_tick_ns == primary_tick_ns:
+            continue
+        if timegap and last_emitted_tick_ns is not None:
+            if (primary_tick_ns - last_emitted_tick_ns) < timegap:
                 continue
-            ts_ref = t if ts_ref < 0 else ts_ref + timegap
-            timing = True
-        elif not timing and canonical_name != timing_source:
-            # Non-timing-source messages: collect them but don't advance frame
-            if not msg_flag[canonical_name]:
-                if canonical_name.startswith("cam_"):
-                    image_msgs[canonical_name] = msg
-                elif canonical_name == "action" or canonical_name.startswith("action_"):
-                    leader_msgs[canonical_name] = msg
-                elif canonical_name == "observation":
-                    follower_msgs[canonical_name] = msg
-                    for sa in shared_action_names:
-                        if not msg_flag[sa]:
-                            leader_msgs[sa] = msg
-                            timestamps[sa].append(t)
-                            schema_map[sa] = schema_name
-                            msg_flag[sa] = True
-                            cnt += 1
-                msg_flag[canonical_name] = True
-                cnt += 1
+        if latest_joint_msg is None:
+            continue
+        if wrench_topic and latest_wrench_msg is None:
+            continue
+        if any(latest_cam_t_ns[cam] != primary_tick_ns for cam in camera_names):
+            continue
+        if any(name not in latest_action_msg for name in dedicated_action_names):
             continue
 
-        # Convention: camera keys must start with "cam_" in camera_topic_map.
-        # Other canonical names: "observation" (state), "action"/"action_*" (leader).
-        if not msg_flag[canonical_name]:
-            if canonical_name.startswith("cam_"):
-                image_msgs[canonical_name] = msg
-            elif canonical_name == "action" or canonical_name.startswith("action_"):
-                leader_msgs[canonical_name] = msg
-            elif canonical_name == "observation":
-                follower_msgs[canonical_name] = msg
-                # Auto-fill shared actions that use the same topic as state
-                for sa in shared_action_names:
-                    if not msg_flag[sa]:
-                        leader_msgs[sa] = msg
-                        timestamps[sa].append(t)
-                        schema_map[sa] = schema_name
-                        msg_flag[sa] = True
-                        cnt += 1
-            msg_flag[canonical_name] = True
-            cnt += 1
+        schema_map = {
+            "observation": latest_joint_schema,
+            **{cam: latest_cam_schema[cam] for cam in camera_names},
+        }
+        if wrench_topic:
+            schema_map["wrench"] = latest_wrench_schema
 
-        if cnt < len(msg_flag):
-            continue
+        leader_msgs = {
+            name: latest_action_msg[name] for name in dedicated_action_names
+        }
+        for name in dedicated_action_names:
+            schema_map[name] = latest_action_schema[name]
+        for sa in shared_action_names:
+            leader_msgs[sa] = latest_joint_msg
+            schema_map[sa] = latest_joint_schema
 
         frame = build_frame(
-            image_msgs, follower_msgs, leader_msgs,
-            joint_order, rot_img, schema_map,
+            image_msgs=dict(latest_cam_msg),
+            follower_msgs={"observation": latest_joint_msg},
+            leader_msgs=leader_msgs,
+            joint_order=joint_order,
+            rot_img=rot_img,
+            schema_map=schema_map,
+            wrench_msg=latest_wrench_msg if wrench_topic else None,
         )
         if frame is not None:
+            frame["emitted_timestamp_ns"] = int(primary_tick_ns)
             frames.append(frame)
-
-        for key in msg_flag:
-            msg_flag[key] = False
-        cnt = 0
-        timing = False
+            last_emitted_tick_ns = primary_tick_ns
 
     return frames, timestamps
 
@@ -298,20 +302,17 @@ def build_extraction_config(
     """Build Rosbag extraction config from metacard fields."""
     camera_topic_map = detail["camera_topic_map"]
     joint_names = detail["joint_names"]
-
-    # 1. Resolve action topics and canonical names
-    action_topic_to_canonical = _resolve_action_topics(
-        detail["action_topics_map"]
-    )
-
-    # 2. Build unified topic map
+    action_topic_to_canonical = _resolve_action_topics(detail["action_topics_map"])
     state_topic = detail["state_topic"]
+    wrench_topic = detail.get("wrench_topic", "")
+
     topic_map: dict[str, str] = {}
     for cam_name, topic in camera_topic_map.items():
         topic_map[topic] = cam_name
     topic_map[state_topic] = "observation"
+    if wrench_topic:
+        topic_map[wrench_topic] = "wrench"
 
-    # Track action canonical names that share the same topic as state
     shared_action_names: list[str] = []
     for action_topic, canonical in action_topic_to_canonical.items():
         if action_topic == state_topic:
@@ -320,7 +321,6 @@ def build_extraction_config(
             topic_map[action_topic] = canonical
     camera_names = sorted(camera_topic_map.keys())
 
-    # 3. Determine action order and joint structure
     all_action_names = sorted(set(action_topic_to_canonical.values()))
     left = [n for n in all_action_names if "left" in n.lower() and "right" not in n.lower()]
     right = [n for n in all_action_names if "right" in n.lower() and "left" not in n.lower()]
@@ -346,4 +346,5 @@ def build_extraction_config(
         hz_min_ratio=HZ_MIN_RATIO,
         robot_type=robot_type,
         shared_action_names=shared_action_names,
+        wrench_topic=wrench_topic,
     )

@@ -499,4 +499,4 @@ Exact frame list is produced by MCAP parsing at conversion time; the entries bel
 
 ## Sign-off
 
-Once approved by the user, this spec hands off to `superpowers:writing-plans` to produce the step-by-step implementation plan.
+Approved 2026-04-20. Implementation plan: `docs/superpowers/plans/2026-04-20-aic-dataset-and-meta-converter.md`.
