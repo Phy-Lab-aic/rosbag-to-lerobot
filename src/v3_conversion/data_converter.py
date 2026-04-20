@@ -106,6 +106,12 @@ def _handle_wrench_stamped(msg_data, joint_order) -> np.ndarray:
         ],
         dtype=np.float32,
     )
+    if joint_order and len(joint_order) != len(result):
+        raise ValueError(
+            f"WrenchStamped produces {len(result)} values but joint_order "
+            f"expects {len(joint_order)}: {joint_order}"
+        )
+    return result
 
 
 _JOINT_HANDLERS = {
