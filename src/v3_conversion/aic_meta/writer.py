@@ -24,3 +24,13 @@ def write_task_parquet(target: Path, rows: Iterable[Dict[str, Any]]) -> None:
 
 def write_scoring_parquet(target: Path, rows: Iterable[Dict[str, Any]]) -> None:
     _write_rows(target, rows, schemas.SCORING_SCHEMA)
+
+
+def write_scene_parquet(target: Path, rows: Iterable[Dict[str, Any]]) -> None:
+    _write_rows(target, rows, schemas.SCENE_SCHEMA)
+
+
+def write_tf_snapshots_parquet(
+    target: Path, rows: Iterable[Dict[str, Any]]
+) -> None:
+    _write_rows(target, rows, schemas.TF_SNAPSHOTS_SCHEMA)

@@ -1,10 +1,13 @@
 from pathlib import Path
 
+import pytest
 import pyarrow.parquet as pq
 
 from v3_conversion.aic_meta.writer import (
     write_scoring_parquet,
     write_task_parquet,
+    write_scene_parquet,
+    write_tf_snapshots_parquet,
 )
 
 
@@ -58,3 +61,42 @@ def test_write_scoring_parquet_roundtrip(tmp_path: Path):
     assert table.num_rows == 1
     import math
     assert math.isclose(table.column("score_total").to_pylist()[0], 94.68, abs_tol=1e-2)
+
+
+def test_write_scene_parquet_roundtrip(tmp_path: Path):
+    target = tmp_path / "aic" / "scene.parquet"
+    row = {
+        "episode_index": 0,
+        "plug_port_distance_init": 0.001,
+        "initial_plug_pose_rel_gripper": [0.0, 0.015385, 0.04245,
+                                           0.4432, -0.4838, 1.3303],
+        "scene_rails": [
+            {"name": "nic_rail_0", "entity_present": True, "entity_name": "nic_card_0"},
+            {"name": "nic_rail_1", "entity_present": False, "entity_name": ""},
+        ],
+    }
+    write_scene_parquet(target, [row])
+    table = pq.read_table(target)
+    rails = table.column("scene_rails").to_pylist()[0]
+    assert rails[0]["entity_name"] == "nic_card_0"
+    assert rails[1]["entity_present"] is False
+
+
+def test_write_tf_snapshots_parquet_roundtrip(tmp_path: Path):
+    target = tmp_path / "aic" / "tf_snapshots.parquet"
+    row = {
+        "episode_index": 0,
+        "scoring_frames_initial": [
+            {"frame_id": "task_board", "parent_frame_id": "world",
+             "pose": [0.15, -0.20, 1.14, 0.0, 0.0, 0.0, 1.0]},
+        ],
+        "scoring_frames_final": [
+            {"frame_id": "task_board", "parent_frame_id": "world",
+             "pose": [0.15, -0.20, 1.14, 0.0, 0.0, 0.0, 1.0]},
+        ],
+    }
+    write_tf_snapshots_parquet(target, [row])
+    table = pq.read_table(target)
+    first = table.column("scoring_frames_initial").to_pylist()[0][0]
+    assert first["frame_id"] == "task_board"
+    assert first["pose"][0] == pytest.approx(0.15)
