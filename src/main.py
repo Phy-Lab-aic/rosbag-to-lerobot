@@ -325,13 +325,8 @@ def run_conversion(config_path: str) -> int:
                 task=task_instruction,
             )
 
-            # 8. Convert episode with custom metadata
-            custom_metadata = {
-                "Serial_number": folder_name,
-                "tags": metadata.get("tags", []),
-                "grade": "",
-            }
-            creator.convert_episode(episode, custom_metadata=custom_metadata)
+            creator.convert_episode(episode)
+
 
             converted_count += 1
             logger.info("  Converted successfully: %s", folder_name)
