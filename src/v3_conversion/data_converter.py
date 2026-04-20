@@ -316,6 +316,12 @@ def frames_to_episode(
             wrench_list.append(np.asarray(f["wrench"], dtype=np.float32))
             any_wrench = True
 
+    if wrench_list and len(wrench_list) != len(obs_list):
+        raise ValueError(
+            "frames_to_episode requires wrench to be present in every frame "
+            "or in none of them"
+        )
+
 
     episode = {
         "obs": np.stack(obs_list, axis=0),

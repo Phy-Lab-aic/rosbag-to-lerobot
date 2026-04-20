@@ -100,3 +100,29 @@ def test_frames_to_episode_stacks_wrench():
     )
     assert episode["wrench"].shape == (2, 6)
     assert np.allclose(episode["wrench"][1], [7, 8, 9, 10, 11, 12])
+
+
+def test_frames_to_episode_rejects_mixed_wrench_presence():
+    frames = [
+        {
+            "images": {},
+            "obs": np.array([0.0], dtype=np.float32),
+            "action": {"action": np.array([0.1], dtype=np.float32)},
+            "wrench": np.array([1, 2, 3, 4, 5, 6], dtype=np.float32),
+        },
+        {
+            "images": {},
+            "obs": np.array([0.2], dtype=np.float32),
+            "action": {"action": np.array([0.3], dtype=np.float32)},
+        },
+    ]
+
+    import pytest
+
+    with pytest.raises(ValueError, match="wrench"):
+        frames_to_episode(
+            frames,
+            action_order=["action"],
+            camera_names=[],
+            task="t",
+        )
