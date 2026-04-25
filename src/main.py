@@ -14,6 +14,7 @@ import json
 import logging
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -55,6 +56,14 @@ from v3_conversion.mcap_reader import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = CONFIG_PATH
+
+
+@dataclass(frozen=True)
+class EpisodeContext:
+    episode_dir: Path
+    trial_dir: Optional[Path]
+    trial_key: str
+    trial_score_folder: str
 
 
 def _load_existing_parquet_rows(path: Path) -> List[Dict[str, Any]]:
@@ -187,16 +196,26 @@ def _find_mcap(folder_name: str) -> Path:
     raise FileNotFoundError(f"No MCAP file found in {folder_dir}")
 
 
-def _find_episode_dir(run_dir: Path) -> Optional[Path]:
-    """Return the first episode dir with metadata, checking root then trials."""
-    root_episode = run_dir / "episode"
-    if (root_episode / "metadata.json").is_file():
-        return root_episode
-
+def _find_episode_context(run_dir: Path) -> Optional[EpisodeContext]:
+    """Return episode metadata context, preferring trial metadata over root."""
     for trial_dir in sorted(run_dir.glob("trial_*")):
         episode_dir = trial_dir / "episode"
         if (episode_dir / "metadata.json").is_file():
-            return episode_dir
+            return EpisodeContext(
+                episode_dir=episode_dir,
+                trial_dir=trial_dir,
+                trial_key=trial_dir.name.split("_score")[0],
+                trial_score_folder=trial_dir.name,
+            )
+
+    root_episode = run_dir / "episode"
+    if (root_episode / "metadata.json").is_file():
+        return EpisodeContext(
+            episode_dir=root_episode,
+            trial_dir=None,
+            trial_key="",
+            trial_score_folder="",
+        )
 
     return None
 
@@ -396,8 +415,8 @@ def run_conversion(
                 logger.info("  Skipped %s: %s", folder_name, reason)
                 continue
 
-            episode_dir = _find_episode_dir(run_dir)
-            if episode_dir is None:
+            episode_context = _find_episode_context(run_dir)
+            if episode_context is None:
                 skipped_count += 1
                 reason = "episode/metadata.json missing"
                 skipped_reasons.append(f"{folder_name}: {reason}")
@@ -464,19 +483,11 @@ def run_conversion(
             ]
 
             # 7. Transform to episode with task derived from episode metadata
-            trial_candidates = sorted(run_dir.glob("trial_*"))
-            if episode_dir.parent == run_dir:
-                trial_dir = trial_candidates[0] if trial_candidates else run_dir
-            else:
-                trial_dir = episode_dir.parent
-            episode_meta = load_episode_metadata(episode_dir)
+            episode_meta = load_episode_metadata(episode_context.episode_dir)
             task_instruction = build_task_string(episode_meta)
 
-            trial_key = (
-                trial_dir.name.split("_score")[0]
-                if trial_dir != run_dir
-                else ""
-            )
+            trial_dir = episode_context.trial_dir or run_dir
+            trial_key = episode_context.trial_key
             run_meta = load_run_meta(run_dir)
             tags_meta = load_tags(trial_dir)
             scoring_meta = load_scoring_yaml(trial_dir, trial_key=trial_key)
@@ -502,7 +513,7 @@ def run_conversion(
                 "episode_index": ep_idx,
                 "run_folder": folder_name,
                 "trial_key": trial_key,
-                "trial_score_folder": trial_dir.name,
+                "trial_score_folder": episode_context.trial_score_folder,
                 "schema_version": tags_meta["schema_version"],
                 "cable_type": episode_meta["cable_type"],
                 "cable_name": episode_meta["cable_name"],
