@@ -250,6 +250,64 @@ def test_run_conversion_skips_when_validation_fails(monkeypatch, tmp_path):
     assert not any("Failed to convert" in message for message in logged_errors)
 
 
+def test_run_conversion_skips_missing_required_topics_before_dataset_creation(
+    monkeypatch, tmp_path
+):
+    main, _ = _import_main(monkeypatch)
+    input_root, run_dir = _make_input_tree(tmp_path)
+    logged_info = []
+    logged_errors = []
+    creator_inits = []
+    extract_calls = []
+
+    class FakeDataCreator:
+        def __init__(self, **kwargs):
+            creator_inits.append(kwargs)
+
+    monkeypatch.setattr(main, "INPUT_PATH", input_root)
+    monkeypatch.setattr(main, "OUTPUT_PATH", tmp_path / "output")
+    monkeypatch.setattr(main, "DataCreator", FakeDataCreator)
+    monkeypatch.setattr(main, "_load_config", lambda _: _fake_config())
+    monkeypatch.setattr(main, "_load_metacard", lambda folder, defaults=None: {})
+    monkeypatch.setattr(
+        main,
+        "_prepare_config",
+        lambda folder, metadata, robot_type, fps: (run_dir / "run_001_0.mcap", _fake_bag_config()),
+    )
+    monkeypatch.setattr(
+        main,
+        "validate_mcap_topics",
+        lambda bag_path, topic_map: {"missing_topics": ["/joint_states"]},
+    )
+    monkeypatch.setattr(
+        main,
+        "extract_frames",
+        lambda bag_path, config: extract_calls.append((bag_path, config)),
+    )
+    monkeypatch.setattr(
+        main.logger,
+        "info",
+        lambda msg, *args, **kwargs: logged_info.append(msg % args if args else msg),
+    )
+    monkeypatch.setattr(
+        main.logger,
+        "error",
+        lambda msg, *args, **kwargs: logged_errors.append(msg % args if args else msg),
+    )
+
+    result = main.run_conversion("ignored.json")
+
+    assert result == 1
+    assert creator_inits == []
+    assert extract_calls == []
+    assert any("Skipped folders" in message for message in logged_info)
+    assert any(
+        "missing required MCAP topics: ['/joint_states']" in message
+        for message in logged_info
+    )
+    assert not any("Failed to convert" in message for message in logged_errors)
+
+
 def test_run_conversion_does_not_persist_episode_when_aic_meta_extraction_fails(
     monkeypatch, tmp_path
 ):

@@ -91,6 +91,61 @@ def test_extract_pose_labels_uses_tf_fallback_for_tcp(
     assert labels["label.tcp_pose_valid"].tolist() == [True]
 
 
+def test_extract_pose_labels_composes_chained_tf_fallback_for_tcp(
+    build_mcap_fixture, tmp_path: Path
+):
+    bag = build_mcap_fixture(
+        path=tmp_path / "tcp_tf_chain.mcap",
+        tf=[
+            (
+                0,
+                [
+                    (
+                        "base_link",
+                        "wrist_3_link",
+                        0.1,
+                        0.2,
+                        0.3,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ),
+                    (
+                        "wrist_3_link",
+                        "tcp_link",
+                        0.4,
+                        0.5,
+                        0.6,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    labels = extract_pose_labels(
+        bag_path=bag,
+        frame_timestamps_ns=[0],
+        episode_meta={
+            "cable_name": "cable_0",
+            "plug_name": "sfp_tip",
+            "port_name": "sfp_port_0",
+            "target_module": "nic_card_mount_0",
+        },
+        base_frame="base_link",
+    )
+
+    assert labels["label.tcp_pose_valid"].tolist() == [True]
+    assert np.allclose(
+        labels["label.tcp_pose"][0],
+        [0.5, 0.7, 0.9, 0.0, 0.0, 0.0, 1.0],
+    )
+
+
 def test_extract_pose_labels_prioritizes_controller_state_over_tf_for_tcp(
     build_mcap_fixture, tmp_path: Path
 ):
@@ -354,8 +409,8 @@ def test_extract_pose_labels_uses_ordered_candidate_preference(
     )
 
 
-def test_decoded_messages_skips_channel_when_decoder_construction_fails(
-    tmp_path: Path, monkeypatch
+def test_decoded_messages_warns_when_decoder_construction_fails(
+    tmp_path: Path, monkeypatch, caplog
 ):
     class Schema:
         def __init__(self, record_id):
@@ -396,7 +451,13 @@ def test_decoded_messages_skips_channel_when_decoder_construction_fails(
     bag.write_bytes(b"fake")
     monkeypatch.setattr(pose_labels, "StreamReader", FakeStreamReader)
     monkeypatch.setattr(pose_labels, "DecoderFactory", lambda: FakeFactory())
+    monkeypatch.setattr(pose_labels.logger, "propagate", True)
+
+    caplog.set_level("WARNING", logger="v3_conversion.aic_meta.pose_labels")
 
     messages = list(pose_labels._decoded_messages(bag, {"/tf", "/scoring/tf"}))
 
     assert messages == [("/scoring/tf", 20, "good")]
+    assert "Unable to construct decoder" in caplog.text
+    assert "/tf" in caplog.text
+    assert "bad decoder" in caplog.text

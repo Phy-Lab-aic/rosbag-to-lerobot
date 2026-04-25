@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import traceback
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -11,6 +13,8 @@ from mcap.stream_reader import StreamReader
 from mcap_ros2.decoder import DecoderFactory
 
 
+logger = logging.getLogger(__name__)
+
 POSE_LABEL_KEYS = (
     "label.tcp_pose",
     "label.plug_pose_base",
@@ -18,7 +22,7 @@ POSE_LABEL_KEYS = (
     "label.target_module_pose_base",
 )
 
-_TCP_FRAME_CANDIDATES = {"tcp_link", "tool0", "tool_link"}
+_TCP_FRAME_CANDIDATES = ("tcp_link", "tool0", "tool_link")
 _NUMERIC_SUFFIX_RE = re.compile(r"^(?P<stem>.+)_\d+$")
 
 
@@ -132,14 +136,32 @@ def _decoded_messages(bag_path: Path, wanted_topics: set[str]):
                         continue
                     schema = schemas.get(channel.schema_id)
                     if schema is None:
+                        logger.warning(
+                            "Skipping MCAP message for topic %s on channel %s: "
+                            "missing schema id %s",
+                            channel.topic,
+                            record.channel_id,
+                            channel.schema_id,
+                        )
                         continue
                     if record.channel_id not in decoders:
                         try:
-                            decoders[record.channel_id] = decoder_factory.decoder_for(
+                            decoder = decoder_factory.decoder_for(
                                 channel.message_encoding, schema
                             )
+                            if decoder is None:
+                                raise ValueError("decoder factory returned None")
+                            decoders[record.channel_id] = decoder
                         except Exception:
                             decoders[record.channel_id] = None
+                            logger.warning(
+                                "Unable to construct decoder for topic %s "
+                                "(channel=%s, schema=%s): %s",
+                                channel.topic,
+                                record.channel_id,
+                                getattr(schema, "name", channel.schema_id),
+                                traceback.format_exc(limit=1).strip(),
+                            )
                             continue
                     decoder = decoders[record.channel_id]
                     if decoder is None:
@@ -147,8 +169,22 @@ def _decoded_messages(bag_path: Path, wanted_topics: set[str]):
                     try:
                         yield channel.topic, int(record.log_time), decoder(record.data)
                     except Exception:
+                        logger.warning(
+                            "Unable to decode MCAP message for topic %s "
+                            "(channel=%s, schema=%s, log_time=%s): %s",
+                            channel.topic,
+                            record.channel_id,
+                            getattr(schema, "name", channel.schema_id),
+                            record.log_time,
+                            traceback.format_exc(limit=1).strip(),
+                        )
                         continue
     except Exception:
+        logger.warning(
+            "Unable to read pose-label source topics from %s: %s",
+            bag_path,
+            traceback.format_exc(limit=1).strip(),
+        )
         return
 
 
@@ -304,6 +340,7 @@ def extract_pose_labels(
         "label.port_pose_base": [],
         "label.target_module_pose_base": [],
     }
+    tf_transforms: dict[str, tuple[str, np.ndarray]] = {}
     scoring_transforms: dict[str, tuple[str, np.ndarray]] = {}
 
     cable_name = str(episode_meta.get("cable_name", ""))
@@ -329,18 +366,48 @@ def extract_pose_labels(
         {"/aic_controller/controller_state", "/tf", "/scoring/tf"},
     ):
         if topic == "/aic_controller/controller_state" and hasattr(msg, "tcp_pose"):
-            tcp_samples.append((t_ns, _pose_from_pose_msg(msg.tcp_pose)))
+            try:
+                tcp_samples.append((t_ns, _pose_from_pose_msg(msg.tcp_pose)))
+            except Exception:
+                logger.warning(
+                    "Skipping malformed controller-state TCP pose "
+                    "(topic=%s, log_time=%s): %s",
+                    topic,
+                    t_ns,
+                    traceback.format_exc(limit=1).strip(),
+                )
             continue
 
         transforms = getattr(msg, "transforms", [])
         if topic == "/tf":
             for transform_stamped in transforms:
-                if _parent_frame_id(transform_stamped) != normalized_base_frame:
+                child = _child_frame_id(transform_stamped)
+                if not child:
                     continue
-                if _child_frame_id(transform_stamped) in _TCP_FRAME_CANDIDATES:
-                    tf_tcp_samples.append(
-                        (t_ns, _pose_from_transform(transform_stamped.transform))
+                try:
+                    tf_transforms[child] = (
+                        _parent_frame_id(transform_stamped),
+                        _pose_from_transform(transform_stamped.transform),
                     )
+                except Exception:
+                    logger.warning(
+                        "Skipping malformed TCP TF transform "
+                        "(topic=%s, child=%s, log_time=%s): %s",
+                        topic,
+                        child,
+                        t_ns,
+                        traceback.format_exc(limit=1).strip(),
+                    )
+                    continue
+            for child_frame in _TCP_FRAME_CANDIDATES:
+                pose = _compose_path_to_base(
+                    tf_transforms,
+                    normalized_base_frame,
+                    child_frame,
+                )
+                if pose is not None:
+                    tf_tcp_samples.append((t_ns, pose))
+                    break
             continue
 
         if topic == "/scoring/tf":
@@ -348,10 +415,20 @@ def extract_pose_labels(
                 child = _child_frame_id(transform_stamped)
                 if not child:
                     continue
-                scoring_transforms[child] = (
-                    _parent_frame_id(transform_stamped),
-                    _pose_from_transform(transform_stamped.transform),
-                )
+                try:
+                    scoring_transforms[child] = (
+                        _parent_frame_id(transform_stamped),
+                        _pose_from_transform(transform_stamped.transform),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Skipping malformed scoring TF transform "
+                        "(topic=%s, child=%s, log_time=%s): %s",
+                        topic,
+                        child,
+                        t_ns,
+                        traceback.format_exc(limit=1).strip(),
+                    )
 
             _append_first_resolved_scoring_sample(
                 scoring_samples,

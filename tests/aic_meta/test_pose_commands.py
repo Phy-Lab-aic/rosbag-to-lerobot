@@ -177,8 +177,15 @@ def test_extract_pose_commands_preserves_sparse_times(
     assert rows[0]["damping"] == [20.0] * 36
 
 
-def test_extract_pose_commands_skips_malformed_decoded_messages(tmp_path: Path):
+def test_extract_pose_commands_warns_for_malformed_decoded_messages(
+    tmp_path: Path, monkeypatch, caplog
+):
     bag = _build_mixed_pose_command_mcap(tmp_path / "mixed_commands.mcap")
+
+    from v3_conversion.aic_meta import pose_commands
+
+    monkeypatch.setattr(pose_commands.logger, "propagate", True)
+    caplog.set_level("WARNING", logger="v3_conversion.aic_meta.pose_commands")
 
     rows = extract_pose_commands(
         bag_path=bag,
@@ -187,6 +194,8 @@ def test_extract_pose_commands_skips_malformed_decoded_messages(tmp_path: Path):
     )
 
     assert len(rows) == 1
+    assert "Skipping malformed pose command" in caplog.text
+    assert "/aic_controller/pose_commands" in caplog.text
     assert rows[0]["episode_index"] == 3
     assert rows[0]["t_ns"] == 1_500_000_000
     assert rows[0]["time_sec"] == pytest.approx(0.5)

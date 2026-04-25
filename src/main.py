@@ -431,7 +431,19 @@ def run_conversion(
                 folder_name, metadata, robot_type, fps_override
             )
 
-            # 3. Initialize DataCreator on first successful config
+            # 3. Pre-check: all expected topics exist in MCAP
+            validation = validate_mcap_topics(str(mcap_path), config.topic_map)
+            if validation["missing_topics"]:
+                skipped_count += 1
+                reason = (
+                    "missing required MCAP topics: "
+                    f"{validation['missing_topics']}"
+                )
+                skipped_reasons.append(f"{folder_name}: {reason}")
+                logger.info("  Skipped %s: %s", folder_name, reason)
+                continue
+
+            # 4. Initialize DataCreator on first run that will extract frames
             if creator is None:
                 creator = DataCreator(
                     repo_id=repo_id,
@@ -441,14 +453,6 @@ def run_conversion(
                     joint_order=config.joint_order,
                     camera_names=config.camera_names,
                     fps=config.fps,
-                )
-
-            # 4. Pre-check: all expected topics exist in MCAP
-            validation = validate_mcap_topics(str(mcap_path), config.topic_map)
-            if validation["missing_topics"]:
-                raise ValueError(
-                    f"MCAP topic pre-check failed [folder={folder_name}]: "
-                    f"missing {validation['missing_topics']}"
                 )
 
             # 5. Extract frames

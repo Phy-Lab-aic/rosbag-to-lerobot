@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List
 
 from mcap.stream_reader import StreamReader
 from mcap_ros2.decoder import DecoderFactory
+
+
+logger = logging.getLogger(__name__)
 
 
 def _pose_list(pose: Any) -> list[float]:
@@ -42,6 +47,7 @@ def extract_pose_commands(
     channels: dict[int, Any] = {}
     decoders: dict[int, Any] = {}
     rows: list[Dict[str, Any]] = []
+    message_count = 0
 
     try:
         with Path(bag_path).open("rb") as f:
@@ -60,23 +66,50 @@ def extract_pose_commands(
                         continue
                     schema = schemas.get(channel.schema_id)
                     if schema is None:
+                        logger.warning(
+                            "Skipping pose command on channel %s: missing schema id %s",
+                            record.channel_id,
+                            channel.schema_id,
+                        )
                         continue
                     if record.channel_id not in decoders:
                         try:
-                            decoders[record.channel_id] = (
-                                decoder_factory.decoder_for(
-                                    channel.message_encoding, schema
-                                )
+                            decoder = decoder_factory.decoder_for(
+                                channel.message_encoding, schema
                             )
+                            if decoder is None:
+                                raise ValueError("decoder factory returned None")
+                            decoders[record.channel_id] = decoder
                         except Exception:
                             decoders[record.channel_id] = None
+                            logger.warning(
+                                "Unable to construct decoder for pose commands "
+                                "(topic=%s, channel=%s, schema=%s): %s",
+                                channel.topic,
+                                record.channel_id,
+                                getattr(schema, "name", channel.schema_id),
+                                traceback.format_exc(limit=1).strip(),
+                            )
                             continue
                     decoder = decoders[record.channel_id]
                     if decoder is None:
                         continue
                     try:
                         msg = decoder(record.data)
-                        t_ns = int(record.log_time)
+                        message_count += 1
+                    except Exception:
+                        logger.warning(
+                            "Unable to decode pose command "
+                            "(topic=%s, channel=%s, schema=%s, log_time=%s): %s",
+                            channel.topic,
+                            record.channel_id,
+                            getattr(schema, "name", channel.schema_id),
+                            record.log_time,
+                            traceback.format_exc(limit=1).strip(),
+                        )
+                        continue
+                    t_ns = int(record.log_time)
+                    try:
                         rows.append(
                             {
                                 "episode_index": int(episode_index),
@@ -97,7 +130,24 @@ def extract_pose_commands(
                             }
                         )
                     except Exception:
+                        logger.warning(
+                            "Skipping malformed pose command "
+                            "(topic=%s, channel=%s, schema=%s, log_time=%s): %s",
+                            channel.topic,
+                            record.channel_id,
+                            getattr(schema, "name", channel.schema_id),
+                            record.log_time,
+                            traceback.format_exc(limit=1).strip(),
+                        )
                         continue
     except Exception:
+        logger.warning(
+            "Unable to read pose commands from %s after %d decoded messages "
+            "and %d materialized rows: %s",
+            bag_path,
+            message_count,
+            len(rows),
+            traceback.format_exc(limit=1).strip(),
+        )
         return rows
     return rows
