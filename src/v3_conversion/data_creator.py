@@ -95,6 +95,13 @@ class DataCreator:
             },
         }
 
+        if "velocity" in episode:
+            features["observation.velocity"] = {
+                "dtype": "float32",
+                "shape": (obs_dim,),
+                "names": self.joint_order["obs"],
+            }
+
         if "wrench" in episode:
             wrench_dim = int(np.asarray(episode["wrench"]).shape[-1])
             features["observation.wrench"] = {
@@ -156,6 +163,11 @@ class DataCreator:
             self.dataset.episode_buffer = self.dataset.create_episode_buffer()
 
         obs = np.asarray(episode["obs"], dtype=np.float32)
+        velocity = (
+            np.asarray(episode["velocity"], dtype=np.float32)
+            if "velocity" in episode
+            else None
+        )
 
         actions = []
         for key in self.action_order:
@@ -176,6 +188,20 @@ class DataCreator:
 
         dataset_has_wrench = "observation.wrench" in self.dataset.features
         episode_has_wrench = "wrench" in episode
+        dataset_has_velocity = "observation.velocity" in self.dataset.features
+        episode_has_velocity = velocity is not None
+        if dataset_has_velocity and not episode_has_velocity:
+            raise ValueError(
+                "Dataset expects observation.velocity but this episode does not provide velocity data."
+            )
+        if episode_has_velocity and not dataset_has_velocity:
+            raise ValueError(
+                "This episode provides velocity data but the dataset was created without observation.velocity."
+            )
+        if episode_has_velocity and len(velocity) != frame_count:
+            raise ValueError(
+                f"Velocity has {len(velocity)} frames, expected {frame_count}"
+            )
         if dataset_has_wrench and not episode_has_wrench:
             raise ValueError(
                 "Dataset expects observation.wrench but this episode does not provide wrench data."
@@ -203,6 +229,8 @@ class DataCreator:
                 "observation.state": obs[t],
                 "action": actions[t],
             }
+            if velocity is not None:
+                frame["observation.velocity"] = velocity[t]
             if "wrench" in episode:
                 frame["observation.wrench"] = np.asarray(
                     episode["wrench"][t], dtype=np.float32

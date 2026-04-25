@@ -36,6 +36,16 @@ def _handle_joint_state(msg_data, joint_order: List[str]) -> np.ndarray:
     return np.array(ordered, dtype=np.float32)
 
 
+def _handle_joint_state_velocity(msg_data, joint_order: List[str]) -> np.ndarray:
+    """Extract JointState velocity in canonical joint order."""
+    velocity_map = dict(zip(msg_data.name, msg_data.velocity))
+    missing = [name for name in joint_order if name not in velocity_map]
+    if missing:
+        raise KeyError(f"Missing joints in JointState velocity: {missing}")
+    ordered = [velocity_map[name] for name in joint_order]
+    return np.array(ordered, dtype=np.float32)
+
+
 def _handle_odometry(msg_data, joint_order: List[str]) -> np.ndarray:
     """Handle nav_msgs/msg/Odometry.
 
@@ -262,6 +272,12 @@ def build_frame(
             )
     follower_data = np.concatenate(follower_arrays) if follower_arrays else np.array([], dtype=np.float32)
 
+    velocity_data = None
+    obs_msg = (follower_msgs or {}).get("observation")
+    obs_schema = schema_map.get("observation", "")
+    if obs_msg is not None and obs_schema == "sensor_msgs/msg/JointState":
+        velocity_data = _handle_joint_state_velocity(obs_msg, joint_order["obs"])
+
     # -- action (leader) --
     leader_joint_order = joint_order.get("action")
     if leader_msgs is None or leader_joint_order is None:
@@ -281,6 +297,8 @@ def build_frame(
                 camera_data[k] = v[::-1, ::-1].copy()
 
     result = {"images": camera_data, "obs": follower_data, "action": action_data}
+    if velocity_data is not None:
+        result["velocity"] = velocity_data
     if wrench_msg is not None:
         wrench_schema = schema_map.get("wrench", "geometry_msgs/msg/WrenchStamped")
         result["wrench"] = _convert_joint_msg(wrench_msg, None, wrench_schema)
@@ -297,6 +315,7 @@ def frames_to_episode(
     obs_list = []
     action_lists = {key: [] for key in action_order}
     camera_lists = {cam: [] for cam in camera_names}
+    velocity_list: list = []
     wrench_list: list = []
 
     # Pop frames from the input list to free memory as we consume them
@@ -313,10 +332,19 @@ def frames_to_episode(
             if cam in imgs:
                 camera_lists[cam].append(imgs[cam])
 
+        if "velocity" in f:
+            velocity_list.append(np.asarray(f["velocity"], dtype=np.float32))
+
         if "wrench" in f:
             wrench_list.append(np.asarray(f["wrench"], dtype=np.float32))
 
         f.clear()
+
+    if velocity_list and len(velocity_list) != len(obs_list):
+        raise ValueError(
+            "frames_to_episode requires velocity to be present in every frame "
+            "or in none of them"
+        )
 
     if wrench_list and len(wrench_list) != len(obs_list):
         raise ValueError(
@@ -333,6 +361,9 @@ def frames_to_episode(
     for key in action_order:
         episode[key] = np.stack(action_lists[key], axis=0)
     del action_lists
+
+    if velocity_list:
+        episode["velocity"] = np.stack(velocity_list, axis=0)
 
     if wrench_list:
         episode["wrench"] = np.stack(wrench_list, axis=0)
