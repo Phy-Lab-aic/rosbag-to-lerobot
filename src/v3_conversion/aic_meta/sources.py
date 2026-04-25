@@ -210,18 +210,30 @@ def load_validation_status(run_dir: Path) -> Dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as f:
             raw = json.load(f)
-    except Exception as exc:
-        return {"passed": False, "reason": f"validation.json unreadable: {exc}"}
+    except json.JSONDecodeError:
+        return {"passed": False, "reason": "validation.json invalid json"}
+    except OSError:
+        return {"passed": False, "reason": "validation.json unreadable"}
 
-    checks = raw.get("checks") or []
+    if not isinstance(raw, dict):
+        return {"passed": False, "reason": "validation.json invalid: expected object"}
+
+    for key in ("passed_count", "total_count", "checks"):
+        if key not in raw:
+            return {"passed": False, "reason": f"validation.json invalid: missing {key}"}
+
+    checks = raw["checks"]
+    if not isinstance(checks, list):
+        return {"passed": False, "reason": "validation.json invalid: checks must be list"}
+
     for check in checks:
         if isinstance(check, dict) and check.get("passed") is False:
             name = str(check.get("name", "unnamed"))
             return {"passed": False, "reason": f"validation.json failed check: {name}"}
 
-    passed_count = raw.get("passed_count")
-    total_count = raw.get("total_count")
-    if passed_count is not None and total_count is not None and passed_count != total_count:
+    passed_count = raw["passed_count"]
+    total_count = raw["total_count"]
+    if passed_count != total_count:
         return {
             "passed": False,
             "reason": f"validation.json passed_count {passed_count} != total_count {total_count}",
