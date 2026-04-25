@@ -36,9 +36,13 @@ def _handle_joint_state(msg_data, joint_order: List[str]) -> np.ndarray:
     return np.array(ordered, dtype=np.float32)
 
 
-def _handle_joint_state_velocity(msg_data, joint_order: List[str]) -> np.ndarray:
+def _handle_joint_state_velocity(msg_data, joint_order: List[str]) -> np.ndarray | None:
     """Extract JointState velocity in canonical joint order."""
-    velocity_map = dict(zip(msg_data.name, msg_data.velocity))
+    velocities = getattr(msg_data, "velocity", None)
+    if not velocities:
+        return None
+
+    velocity_map = dict(zip(msg_data.name, velocities))
     missing = [name for name in joint_order if name not in velocity_map]
     if missing:
         raise KeyError(f"Missing joints in JointState velocity: {missing}")
