@@ -1,5 +1,6 @@
 import importlib
 import json
+import logging
 import sys
 import types
 from pathlib import Path
@@ -497,7 +498,7 @@ def test_run_conversion_uses_first_emitted_frame_timestamp_for_insertion_event(
 
 
 def test_run_conversion_skips_push_to_hub_when_finalize_metadata_write_fails(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, tmp_path, caplog
 ):
     main, recording_dataset_cls = _import_main(monkeypatch)
     input_root, run_dir = _make_input_tree(tmp_path)
@@ -615,13 +616,16 @@ def test_run_conversion_skips_push_to_hub_when_finalize_metadata_write_fails(
         lambda target, rows: (_ for _ in ()).throw(RuntimeError("write failed")),
     )
 
-    result = main.run_conversion("ignored.json")
-    captured = capsys.readouterr()
+    with caplog.at_level(logging.WARNING, logger=main.logger.name):
+        result = main.run_conversion("ignored.json")
 
     assert result == 2
     assert recording_dataset_cls.push_calls == []
-    assert "Failed to finalize dataset or write AIC metadata" in captured.err
-    assert "Skipping push_to_hub because dataset finalization or AIC metadata write failed" in captured.err
+    assert "Failed to finalize dataset or write AIC metadata" in caplog.text
+    assert (
+        "Skipping push_to_hub because dataset finalization or AIC metadata write failed"
+        in caplog.text
+    )
 
 
 def test_run_conversion_merge_mode_preserves_existing_aic_rows(
