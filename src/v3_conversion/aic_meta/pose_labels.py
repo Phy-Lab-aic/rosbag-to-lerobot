@@ -82,6 +82,8 @@ def frame_id_candidates(
                 f"{cable}/{base}_link_entrance",
             ]
         )
+    if module and base == module:
+        candidates.append(f"task_board/{module}")
     if module and base:
         candidates.extend(
             [
@@ -93,7 +95,6 @@ def frame_id_candidates(
     if module and base == module:
         candidates.extend(
             [
-                f"task_board/{module}",
                 f"task_board/{module}/{module}_link",
             ]
         )
@@ -268,18 +269,21 @@ def _compose_path_to_base(
     return composed
 
 
-def _append_scoring_sample_if_available(
+def _append_first_resolved_scoring_sample(
     scoring_samples: dict[str, list[tuple[int, np.ndarray]]],
     transforms_by_child: dict[str, tuple[str, np.ndarray]],
     label_key: str,
-    child_frame: str,
+    candidates: Iterable[str],
     t_ns: int,
     base_frame: str,
 ) -> None:
-    pose = _compose_path_to_base(transforms_by_child, base_frame, child_frame)
-    if pose is None:
-        _, pose = transforms_by_child[child_frame]
-    scoring_samples[label_key].append((t_ns, pose))
+    for child_frame in candidates:
+        if child_frame not in transforms_by_child:
+            continue
+        pose = _compose_path_to_base(transforms_by_child, base_frame, child_frame)
+        if pose is not None:
+            scoring_samples[label_key].append((t_ns, pose))
+            return
 
 
 def extract_pose_labels(
@@ -304,26 +308,20 @@ def extract_pose_labels(
 
     cable_name = str(episode_meta.get("cable_name", ""))
     target_module = str(episode_meta.get("target_module", ""))
-    plug_candidates = set(
-        frame_id_candidates(
-            str(episode_meta.get("plug_name", "")),
-            cable_name=cable_name,
-            target_module=target_module,
-        )
+    plug_candidates = frame_id_candidates(
+        str(episode_meta.get("plug_name", "")),
+        cable_name=cable_name,
+        target_module=target_module,
     )
-    port_candidates = set(
-        frame_id_candidates(
-            str(episode_meta.get("port_name", "")),
-            cable_name=cable_name,
-            target_module=target_module,
-        )
+    port_candidates = frame_id_candidates(
+        str(episode_meta.get("port_name", "")),
+        cable_name=cable_name,
+        target_module=target_module,
     )
-    target_candidates = set(
-        frame_id_candidates(
-            target_module,
-            cable_name=cable_name,
-            target_module=target_module,
-        )
+    target_candidates = frame_id_candidates(
+        target_module,
+        cable_name=cable_name,
+        target_module=target_module,
     )
 
     for topic, t_ns, msg in _decoded_messages(
@@ -355,33 +353,30 @@ def extract_pose_labels(
                     _pose_from_transform(transform_stamped.transform),
                 )
 
-            for child in plug_candidates.intersection(scoring_transforms):
-                _append_scoring_sample_if_available(
-                    scoring_samples,
-                    scoring_transforms,
-                    "label.plug_pose_base",
-                    child,
-                    t_ns,
-                    normalized_base_frame,
-                )
-            for child in port_candidates.intersection(scoring_transforms):
-                _append_scoring_sample_if_available(
-                    scoring_samples,
-                    scoring_transforms,
-                    "label.port_pose_base",
-                    child,
-                    t_ns,
-                    normalized_base_frame,
-                )
-            for child in target_candidates.intersection(scoring_transforms):
-                _append_scoring_sample_if_available(
-                    scoring_samples,
-                    scoring_transforms,
-                    "label.target_module_pose_base",
-                    child,
-                    t_ns,
-                    normalized_base_frame,
-                )
+            _append_first_resolved_scoring_sample(
+                scoring_samples,
+                scoring_transforms,
+                "label.plug_pose_base",
+                plug_candidates,
+                t_ns,
+                normalized_base_frame,
+            )
+            _append_first_resolved_scoring_sample(
+                scoring_samples,
+                scoring_transforms,
+                "label.port_pose_base",
+                port_candidates,
+                t_ns,
+                normalized_base_frame,
+            )
+            _append_first_resolved_scoring_sample(
+                scoring_samples,
+                scoring_transforms,
+                "label.target_module_pose_base",
+                target_candidates,
+                t_ns,
+                normalized_base_frame,
+            )
 
     tcp_source = tcp_samples if tcp_samples else tf_tcp_samples
     _fill_from_samples(

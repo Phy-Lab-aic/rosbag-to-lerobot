@@ -258,6 +258,102 @@ def test_extract_pose_labels_composes_scoring_tf_chain_to_base(
     )
 
 
+def test_extract_pose_labels_leaves_orphan_non_base_scoring_tf_invalid(
+    build_mcap_fixture, tmp_path: Path
+):
+    bag = build_mcap_fixture(
+        path=tmp_path / "scoring_orphan.mcap",
+        scoring_tf=[
+            (
+                50_000_000,
+                [
+                    (
+                        "task_board",
+                        "task_board/nic_card_mount_0",
+                        0.0,
+                        2.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ),
+                ],
+            )
+        ],
+    )
+
+    labels = extract_pose_labels(
+        bag_path=bag,
+        frame_timestamps_ns=[50_000_000],
+        episode_meta={
+            "cable_name": "cable_0",
+            "plug_name": "sfp_tip",
+            "port_name": "sfp_port_0",
+            "target_module": "nic_card_mount_0",
+        },
+        base_frame="base_link",
+    )
+
+    assert labels["label.target_module_pose_base_valid"].tolist() == [False]
+    assert math.isnan(float(labels["label.target_module_pose_base"][0][0]))
+
+
+def test_extract_pose_labels_uses_ordered_candidate_preference(
+    build_mcap_fixture, tmp_path: Path
+):
+    bag = build_mcap_fixture(
+        path=tmp_path / "scoring_preference.mcap",
+        scoring_tf=[
+            (
+                50_000_000,
+                [
+                    (
+                        "base_link",
+                        "task_board/nic_card_mount_0",
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ),
+                    (
+                        "base_link",
+                        "task_board/nic_card_mount_0/nic_card_mount_0_link",
+                        2.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ),
+                ],
+            )
+        ],
+    )
+
+    labels = extract_pose_labels(
+        bag_path=bag,
+        frame_timestamps_ns=[50_000_000],
+        episode_meta={
+            "cable_name": "cable_0",
+            "plug_name": "sfp_tip",
+            "port_name": "sfp_port_0",
+            "target_module": "nic_card_mount_0",
+        },
+        base_frame="base_link",
+    )
+
+    assert labels["label.target_module_pose_base_valid"].tolist() == [True]
+    assert np.allclose(
+        labels["label.target_module_pose_base"][0],
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    )
+
+
 def test_decoded_messages_skips_channel_when_decoder_construction_fails(
     tmp_path: Path, monkeypatch
 ):
