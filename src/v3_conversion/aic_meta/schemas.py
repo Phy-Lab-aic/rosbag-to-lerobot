@@ -105,3 +105,14 @@ TF_SNAPSHOTS_SCHEMA = pa.schema([
     pa.field("scoring_frames_initial", pa.list_(_FRAME_STRUCT)),
     pa.field("scoring_frames_final", pa.list_(_FRAME_STRUCT)),
 ])
+
+
+POSE_COMMANDS_SCHEMA = pa.schema([
+    pa.field("episode_index", pa.int32(), nullable=False),
+    pa.field("t_ns", pa.int64(), nullable=False),
+    pa.field("time_sec", pa.float32()),
+    pa.field("pose", pa.list_(pa.float32(), list_size=7)),
+    pa.field("velocity", pa.list_(pa.float32(), list_size=6)),
+    pa.field("stiffness", pa.list_(pa.float32())),
+    pa.field("damping", pa.list_(pa.float32())),
+])

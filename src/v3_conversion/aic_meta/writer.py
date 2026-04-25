@@ -1,4 +1,4 @@
-"""Writers for meta/aic/{task,scoring,scene,tf_snapshots}.parquet."""
+"""Writers for meta/aic/*.parquet."""
 
 from pathlib import Path
 from typing import Any, Dict, Iterable
@@ -34,3 +34,9 @@ def write_tf_snapshots_parquet(
     target: Path, rows: Iterable[Dict[str, Any]]
 ) -> None:
     _write_rows(target, rows, schemas.TF_SNAPSHOTS_SCHEMA)
+
+
+def write_pose_commands_parquet(
+    target: Path, rows: Iterable[Dict[str, Any]]
+) -> None:
+    _write_rows(target, rows, schemas.POSE_COMMANDS_SCHEMA)
