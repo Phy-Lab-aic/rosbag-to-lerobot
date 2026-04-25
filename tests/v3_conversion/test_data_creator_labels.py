@@ -80,16 +80,23 @@ def test_data_creator_registers_and_writes_label_features(tmp_dataset_root):
 
     assert creator.dataset.features["label.tcp_pose"]["shape"] == (7,)
     assert creator.dataset.features["label.tcp_pose_valid"]["dtype"] == "bool"
+    assert creator.dataset.features["label.tcp_pose_valid"]["shape"] == (1,)
     assert np.allclose(
         creator.dataset.frames[0]["label.tcp_pose"],
         [1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0],
     )
-    assert creator.dataset.frames[0]["label.tcp_pose_valid"] is True
+    assert np.array_equal(
+        creator.dataset.frames[0]["label.tcp_pose_valid"],
+        np.array([True], dtype=np.bool_),
+    )
     assert np.allclose(
         creator.dataset.frames[1]["label.tcp_pose"],
         [4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 1.0],
     )
-    assert creator.dataset.frames[1]["label.tcp_pose_valid"] is False
+    assert np.array_equal(
+        creator.dataset.frames[1]["label.tcp_pose_valid"],
+        np.array([False], dtype=np.bool_),
+    )
 
 
 def test_data_creator_rejects_label_length_mismatch(tmp_dataset_root):

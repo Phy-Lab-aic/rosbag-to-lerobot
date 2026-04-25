@@ -200,6 +200,7 @@ def extract_frames(
 
     primary_cam_name = camera_names[0] if camera_names else None
     timegap = 1_000_000_000 // fps if fps > 0 else 0
+    camera_sync_tolerance_ns = timegap // 2 if timegap else 0
 
     latest_joint_msg = None
     latest_joint_schema = ""
@@ -256,8 +257,15 @@ def extract_frames(
             continue
         if wrench_topic and latest_wrench_msg is None:
             continue
-        if any(latest_cam_t_ns[cam] != primary_tick_ns for cam in camera_names):
+        if any(latest_cam_t_ns[cam] is None for cam in camera_names):
             continue
+        if camera_sync_tolerance_ns:
+            if any(
+                abs(int(latest_cam_t_ns[cam]) - int(primary_tick_ns))
+                > camera_sync_tolerance_ns
+                for cam in camera_names
+            ):
+                continue
         if any(name not in latest_action_msg for name in dedicated_action_names):
             continue
 

@@ -114,6 +114,50 @@ def test_extract_frames_requires_all_cameras_on_same_tick(build_mcap_fixture, tm
     assert [frame["images"]["cam_right"][0, 0, 0] for frame in frames] == [10, 11]
 
 
+def test_extract_frames_accepts_camera_jitter_within_half_frame(
+    build_mcap_fixture, tmp_path
+):
+    bag = build_mcap_fixture(
+        path=tmp_path / "camera_jitter.mcap",
+        joint_states=[(i * 1_000_000, JOINTS, [i * 0.001] * 7) for i in range(140)],
+        wrench=[(i * 10_000_000, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6) for i in range(20)],
+        images=_mk_sync_images(
+            {
+                "/left_camera/image": [10_000_000, 60_000_000, 110_000_000],
+                "/center_camera/image": [7_000_000, 57_000_000, 107_000_000],
+                "/right_camera/image": [13_000_000, 63_000_000, 113_000_000],
+            }
+        ),
+    )
+    config = Rosbag(
+        topic_map={
+            "/left_camera/image": "cam_left",
+            "/center_camera/image": "cam_center",
+            "/right_camera/image": "cam_right",
+            "/joint_states": "observation",
+            "/fts_broadcaster/wrench": "wrench",
+        },
+        action_order=["action"],
+        joint_order={"obs": JOINTS, "action": {"action": JOINTS}},
+        camera_names=["cam_left", "cam_center", "cam_right"],
+        fps=20,
+        shared_action_names=["action"],
+        wrench_topic="/fts_broadcaster/wrench",
+    )
+
+    frames, _ = extract_frames(bag_path=str(bag), config=config)
+
+    assert len(frames) == 3
+    assert [frame["emitted_timestamp_ns"] for frame in frames] == [
+        10_000_000,
+        60_000_000,
+        110_000_000,
+    ]
+    assert [frame["images"]["cam_left"][0, 0, 0] for frame in frames] == [10, 11, 12]
+    assert [frame["images"]["cam_center"][0, 0, 0] for frame in frames] == [10, 11, 12]
+    assert [frame["images"]["cam_right"][0, 0, 0] for frame in frames] == [10, 11, 12]
+
+
 def test_extract_frames_uses_dedicated_action_topics(build_mcap_fixture, tmp_path):
     cam_times = [0, 50_000_000, 100_000_000]
     bag = build_mcap_fixture(

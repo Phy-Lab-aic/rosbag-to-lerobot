@@ -112,9 +112,12 @@ class DataCreator:
 
         for key in sorted(k for k in episode.keys() if k.startswith("label.")):
             arr = np.asarray(episode[key])
+            feature_shape = tuple(arr.shape[1:])
+            if arr.dtype == np.bool_ and feature_shape == ():
+                feature_shape = (1,)
             features[key] = {
                 "dtype": "bool" if arr.dtype == np.bool_ else "float32",
-                "shape": tuple(arr.shape[1:]),
+                "shape": feature_shape,
                 "names": None,
             }
 
@@ -281,7 +284,11 @@ class DataCreator:
             for key, arr in label_arrays.items():
                 value = arr[t]
                 if arr.dtype == np.bool_:
-                    frame[key] = bool(value) if value.shape == () else value
+                    frame[key] = (
+                        np.asarray([bool(value)], dtype=np.bool_)
+                        if value.shape == ()
+                        else value.astype(np.bool_, copy=False)
+                    )
                 else:
                     frame[key] = value.astype(np.float32, copy=False)
 
