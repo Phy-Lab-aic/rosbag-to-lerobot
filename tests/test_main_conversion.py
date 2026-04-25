@@ -1,6 +1,5 @@
 import importlib
 import json
-import logging
 import sys
 import types
 from pathlib import Path
@@ -10,6 +9,7 @@ import pytest
 import pyarrow.parquet as pq
 
 from v3_conversion.aic_meta.writer import (
+    write_pose_commands_parquet,
     write_scene_parquet,
     write_scoring_parquet,
     write_task_parquet,
@@ -67,6 +67,16 @@ def _make_input_tree(tmp_path: Path) -> tuple[Path, Path]:
     run_dir = input_root / "run_001"
     (run_dir / "trial_1_score95" / "episode").mkdir(parents=True)
     (run_dir / "run_001_0.mcap").write_bytes(b"mcap")
+    (run_dir / "validation.json").write_text(
+        json.dumps(
+            {
+                "passed_count": 1,
+                "total_count": 1,
+                "checks": [{"name": "ok", "passed": True}],
+            }
+        )
+    )
+    (run_dir / "trial_1_score95" / "episode" / "metadata.json").write_text("{}")
     return input_root, run_dir
 
 
@@ -179,6 +189,65 @@ def _tf_row(episode_index: int) -> dict:
             }
         ],
     }
+
+
+def _pose_command_row(episode_index: int) -> dict:
+    return {
+        "episode_index": episode_index,
+        "t_ns": 50_000_000,
+        "time_sec": 0.0,
+        "pose": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0],
+        "velocity": [0.01, 0.02, 0.03, 0.0, 0.0, 0.0],
+        "stiffness": [100.0, 100.0],
+        "damping": [10.0, 10.0],
+    }
+
+
+def test_run_conversion_skips_when_validation_fails(monkeypatch, tmp_path):
+    main, _ = _import_main(monkeypatch)
+    input_root, run_dir = _make_input_tree(tmp_path)
+    logged_info = []
+    logged_errors = []
+    (run_dir / "validation.json").write_text(
+        json.dumps(
+            {
+                "passed_count": 0,
+                "total_count": 1,
+                "checks": [{"name": "episode/metadata.json", "passed": False}],
+            }
+        )
+    )
+
+    monkeypatch.setattr(main, "INPUT_PATH", input_root)
+    monkeypatch.setattr(main, "OUTPUT_PATH", tmp_path / "output")
+    monkeypatch.setattr(main, "_load_config", lambda _: _fake_config())
+    monkeypatch.setattr(
+        main,
+        "_load_metacard",
+        lambda folder, defaults=None: (_ for _ in ()).throw(
+            AssertionError("_load_metacard should not be called for skipped runs")
+        ),
+    )
+    monkeypatch.setattr(
+        main.logger,
+        "info",
+        lambda msg, *args, **kwargs: logged_info.append(msg % args if args else msg),
+    )
+    monkeypatch.setattr(
+        main.logger,
+        "error",
+        lambda msg, *args, **kwargs: logged_errors.append(msg % args if args else msg),
+    )
+
+    result = main.run_conversion("ignored.json")
+
+    assert result == 1
+    assert any("Skipped folders" in message for message in logged_info)
+    assert any(
+        "validation.json failed check: episode/metadata.json" in message
+        for message in logged_info
+    )
+    assert not any("Failed to convert" in message for message in logged_errors)
 
 
 def test_run_conversion_does_not_persist_episode_when_aic_meta_extraction_fails(
@@ -579,6 +648,9 @@ def test_run_conversion_merge_mode_preserves_existing_aic_rows(
     write_scoring_parquet(aic_dir / "scoring.parquet", [_scoring_row(0)])
     write_scene_parquet(aic_dir / "scene.parquet", [_scene_row(0)])
     write_tf_snapshots_parquet(aic_dir / "tf_snapshots.parquet", [_tf_row(0)])
+    write_pose_commands_parquet(
+        aic_dir / "pose_commands.parquet", [_pose_command_row(0)]
+    )
 
     class FakeDataset:
         def __init__(self, total_episodes=1):
@@ -687,6 +759,14 @@ def test_run_conversion_merge_mode_preserves_existing_aic_rows(
         "extract_scoring_tf_snapshots",
         lambda bag_path: {"scoring_frames_initial": [], "scoring_frames_final": []},
     )
+    monkeypatch.setattr(
+        main,
+        "extract_pose_commands",
+        lambda bag_path, episode_index, episode_start_ns: [
+            {**_pose_command_row(episode_index), "t_ns": 75_000_000}
+        ],
+        raising=False,
+    )
 
     result = main.run_conversion(
         "ignored.json", output_dir=str(existing_root), merge=True
@@ -697,6 +777,7 @@ def test_run_conversion_merge_mode_preserves_existing_aic_rows(
     assert pq.read_table(aic_dir / "scoring.parquet").column("episode_index").to_pylist() == [0, 1]
     assert pq.read_table(aic_dir / "scene.parquet").column("episode_index").to_pylist() == [0, 1]
     assert pq.read_table(aic_dir / "tf_snapshots.parquet").column("episode_index").to_pylist() == [0, 1]
+    assert pq.read_table(aic_dir / "pose_commands.parquet").column("episode_index").to_pylist() == [0, 1]
 
 
 def test_load_config_and_metacard_propagate_wrench_topic(monkeypatch, tmp_path):

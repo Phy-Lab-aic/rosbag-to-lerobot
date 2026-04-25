@@ -29,10 +29,15 @@ class _FakeDataset:
 
 
 class _FakeDataCreator:
+    instances = []
+
     def __init__(self, **kwargs):
         self.dataset = None
+        self.episodes = []
+        _FakeDataCreator.instances.append(self)
 
     def convert_episode(self, episode):
+        self.episodes.append(episode)
         if self.dataset is None:
             self.dataset = _FakeDataset()
         self.dataset.meta.total_episodes += 1
@@ -59,11 +64,21 @@ def _import_main(monkeypatch):
 def test_run_conversion_produces_split_aic_parquets(
     build_mcap_fixture, tmp_path: Path, monkeypatch
 ):
+    _FakeDataCreator.instances = []
     run_dir = tmp_path / "input" / "run_test_20260420_000000"
     trial_dir = run_dir / "trial_1_score95"
     episode_dir = trial_dir / "episode"
     episode_dir.mkdir(parents=True)
 
+    (run_dir / "validation.json").write_text(
+        json.dumps(
+            {
+                "passed_count": 1,
+                "total_count": 1,
+                "checks": [{"name": "episode/metadata.json", "passed": True}],
+            }
+        )
+    )
     (run_dir / "policy.txt").write_text("cheatcode\n")
     (run_dir / "seed.txt").write_text("42\n")
     (run_dir / "config.yaml").write_text(
@@ -136,7 +151,8 @@ def test_run_conversion_produces_split_aic_parquets(
         "/right_camera/image": [(t, h, w, img_bytes) for t in cam_times],
     }
     joint_states = [
-        (i * 2_000_000, JOINTS, [i * 0.001] * 7) for i in range(150)
+        (i * 2_000_000, JOINTS, [i * 0.001] * 7, [i * 0.01] * 7)
+        for i in range(150)
     ]
     wrench = [
         (i * 20_000_000, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6) for i in range(7)
@@ -149,6 +165,21 @@ def test_run_conversion_produces_split_aic_parquets(
             [("task_board", "nic_card_mount_0", 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)],
         ),
     ]
+    controller_state = [
+        (0, 0.5, 0.1, 0.2, 0.0, 0.0, 0.0, 1.0),
+        (50_000_000, 0.6, 0.1, 0.2, 0.0, 0.0, 0.0, 1.0),
+    ]
+    pose_commands = [
+        (
+            60_000_000,
+            0.7, 0.1, 0.2,
+            0.0, 0.0, 0.0, 1.0,
+            0.01, 0.02, 0.03,
+            0.0, 0.0, 0.1,
+            [100.0, 100.0],
+            [10.0, 10.0],
+        )
+    ]
     build_mcap_fixture(
         path=run_dir / f"{run_dir.name}_0.mcap",
         joint_states=joint_states,
@@ -156,6 +187,8 @@ def test_run_conversion_produces_split_aic_parquets(
         images=images,
         insertion_event=insertion_event,
         scoring_tf=scoring_tf,
+        controller_state=controller_state,
+        pose_commands=pose_commands,
     )
 
     cfg_path = tmp_path / "config.json"
@@ -194,6 +227,13 @@ def test_run_conversion_produces_split_aic_parquets(
     assert (aic_dir / "scoring.parquet").is_file()
     assert (aic_dir / "scene.parquet").is_file()
     assert (aic_dir / "tf_snapshots.parquet").is_file()
+    assert (aic_dir / "pose_commands.parquet").is_file()
+
+    converted_episode = _FakeDataCreator.instances[0].episodes[0]
+    assert "velocity" in converted_episode
+    assert "label.tcp_pose" in converted_episode
+    assert "label.tcp_pose_valid" in converted_episode
+    assert converted_episode["label.tcp_pose_valid"].tolist() == [True, True]
 
     task_row = pq.read_table(aic_dir / "task.parquet").to_pylist()[0]
     assert task_row["episode_index"] == 0
@@ -216,3 +256,7 @@ def test_run_conversion_produces_split_aic_parquets(
     final_frames = {frame["frame_id"]: frame for frame in tf_row["scoring_frames_final"]}
     assert initial_frames["task_board"]["parent_frame_id"] == "world"
     assert final_frames["nic_card_mount_0"]["parent_frame_id"] == "task_board"
+
+    pose_command_row = pq.read_table(aic_dir / "pose_commands.parquet").to_pylist()[0]
+    assert pose_command_row["episode_index"] == 0
+    assert pose_command_row["t_ns"] == 60_000_000

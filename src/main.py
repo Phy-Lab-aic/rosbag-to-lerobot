@@ -24,15 +24,19 @@ from v3_conversion.aic_meta.scoring_mcap import (
     extract_insertion_event,
     extract_scoring_tf_snapshots,
 )
+from v3_conversion.aic_meta.pose_commands import extract_pose_commands
+from v3_conversion.aic_meta.pose_labels import extract_pose_labels
 from v3_conversion.aic_meta.sources import (
     load_episode_metadata,
     load_run_meta,
     load_scene_from_config,
     load_scoring_yaml,
     load_tags,
+    load_validation_status,
 )
 from v3_conversion.aic_meta.task_string import build_task_string
 from v3_conversion.aic_meta.writer import (
+    write_pose_commands_parquet,
     write_scene_parquet,
     write_scoring_parquet,
     write_task_parquet,
@@ -181,6 +185,20 @@ def _find_mcap(folder_name: str) -> Path:
         return mcaps[0]
 
     raise FileNotFoundError(f"No MCAP file found in {folder_dir}")
+
+
+def _find_episode_dir(run_dir: Path) -> Optional[Path]:
+    """Return the first episode dir with metadata, checking root then trials."""
+    root_episode = run_dir / "episode"
+    if (root_episode / "metadata.json").is_file():
+        return root_episode
+
+    for trial_dir in sorted(run_dir.glob("trial_*")):
+        episode_dir = trial_dir / "episode"
+        if (episode_dir / "metadata.json").is_file():
+            return episode_dir
+
+    return None
 
 
 def _prepare_config(
@@ -347,22 +365,45 @@ def run_conversion(
     creator: Optional[DataCreator] = None
     converted_count = 0
     failed_count = 0
+    skipped_count = 0
     failed_folders: List[str] = []
+    skipped_reasons: List[str] = []
     if merge:
         aic_task_rows = _load_existing_parquet_rows(aic_dir / "task.parquet")
         aic_scoring_rows = _load_existing_parquet_rows(aic_dir / "scoring.parquet")
         aic_scene_rows = _load_existing_parquet_rows(aic_dir / "scene.parquet")
         aic_tf_rows = _load_existing_parquet_rows(aic_dir / "tf_snapshots.parquet")
+        aic_pose_command_rows = _load_existing_parquet_rows(
+            aic_dir / "pose_commands.parquet"
+        )
     else:
         aic_task_rows = []
         aic_scoring_rows = []
         aic_scene_rows = []
         aic_tf_rows = []
+        aic_pose_command_rows = []
 
     for idx, folder_name in enumerate(folders):
         logger.info("[%d/%d] Converting: %s", idx + 1, len(folders), folder_name)
 
         try:
+            run_dir = INPUT_PATH / folder_name
+            validation_status = load_validation_status(run_dir)
+            if not validation_status.get("passed", False):
+                skipped_count += 1
+                reason = str(validation_status.get("reason", "validation failed"))
+                skipped_reasons.append(f"{folder_name}: {reason}")
+                logger.info("  Skipped %s: %s", folder_name, reason)
+                continue
+
+            episode_dir = _find_episode_dir(run_dir)
+            if episode_dir is None:
+                skipped_count += 1
+                reason = "episode/metadata.json missing"
+                skipped_reasons.append(f"{folder_name}: {reason}")
+                logger.info("  Skipped %s: %s", folder_name, reason)
+                continue
+
             # 1. Load metacard (falls back to config defaults)
             metadata = _load_metacard(folder_name, config_defaults)
 
@@ -418,36 +459,45 @@ def run_conversion(
                     f"(missing leader topics or action key mismatch)."
                 )
 
+            frame_timestamps_ns = [
+                int(frame["emitted_timestamp_ns"]) for frame in frames
+            ]
+
             # 7. Transform to episode with task derived from episode metadata
-            trial_candidates = sorted((INPUT_PATH / folder_name).glob("trial_*"))
-            if not trial_candidates:
-                raise FileNotFoundError(
-                    f"No trial_* directory under {INPUT_PATH / folder_name}"
-                )
-            trial_dir = trial_candidates[0]
-            episode_meta = load_episode_metadata(trial_dir / "episode")
+            trial_candidates = sorted(run_dir.glob("trial_*"))
+            if episode_dir.parent == run_dir:
+                trial_dir = trial_candidates[0] if trial_candidates else run_dir
+            else:
+                trial_dir = episode_dir.parent
+            episode_meta = load_episode_metadata(episode_dir)
             task_instruction = build_task_string(episode_meta)
 
-            run_dir = INPUT_PATH / folder_name
-            trial_key = trial_dir.name.split("_score")[0]  # "trial_1_score95" -> "trial_1"
+            trial_key = (
+                trial_dir.name.split("_score")[0]
+                if trial_dir != run_dir
+                else ""
+            )
             run_meta = load_run_meta(run_dir)
             tags_meta = load_tags(trial_dir)
             scoring_meta = load_scoring_yaml(trial_dir, trial_key=trial_key)
             scene_meta = load_scene_from_config(run_dir, trial_key=trial_key)
-            episode_start_ns = int(
-                frames[0].get(
-                    "emitted_timestamp_ns",
-                    timestamps.get(
-                        config.camera_names[0] if config.camera_names else "observation",
-                        [0],
-                    )[0],
-                )
+            episode_start_ns = frame_timestamps_ns[0]
+            pose_labels = extract_pose_labels(
+                bag_path=mcap_path,
+                frame_timestamps_ns=frame_timestamps_ns,
+                episode_meta=episode_meta,
+                base_frame="base_link",
             )
             insertion_meta = extract_insertion_event(
                 mcap_path, episode_start_ns=episode_start_ns,
             )
             tf_snapshots = extract_scoring_tf_snapshots(mcap_path)
             ep_idx = next_episode_index
+            pose_command_rows = extract_pose_commands(
+                bag_path=mcap_path,
+                episode_index=ep_idx,
+                episode_start_ns=episode_start_ns,
+            )
             task_row = {
                 "episode_index": ep_idx,
                 "run_folder": folder_name,
@@ -494,6 +544,7 @@ def run_conversion(
                 task=task_instruction,
             )
             del frames
+            episode.update(pose_labels)
             episode = apply_one_step_shift(episode)
 
             # 8. Convert episode
@@ -503,6 +554,7 @@ def run_conversion(
             aic_scoring_rows.append(scoring_row)
             aic_scene_rows.append(scene_row)
             aic_tf_rows.append(tf_row)
+            aic_pose_command_rows.extend(pose_command_rows)
             next_episode_index += 1
 
             converted_count += 1
@@ -536,6 +588,9 @@ def run_conversion(
             write_scoring_parquet(aic_dir / "scoring.parquet", aic_scoring_rows)
             write_scene_parquet(aic_dir / "scene.parquet", aic_scene_rows)
             write_tf_snapshots_parquet(aic_dir / "tf_snapshots.parquet", aic_tf_rows)
+            write_pose_commands_parquet(
+                aic_dir / "pose_commands.parquet", aic_pose_command_rows
+            )
             finalize_ok = True
         except Exception as e:
             finalize_failed = True
@@ -564,10 +619,15 @@ def run_conversion(
 
     # Summary
     logger.info(
-        "Conversion complete: %d converted, %d failed", converted_count, failed_count
+        "Conversion complete: %d converted, %d failed, %d skipped",
+        converted_count,
+        failed_count,
+        skipped_count,
     )
     if failed_folders:
         logger.info("Failed folders: %s", failed_folders)
+    if skipped_reasons:
+        logger.info("Skipped folders: %s", skipped_reasons)
 
     if converted_count == 0:
         return 1
