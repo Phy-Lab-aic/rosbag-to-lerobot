@@ -110,6 +110,14 @@ class DataCreator:
                 "names": ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"][:wrench_dim],
             }
 
+        for key in sorted(k for k in episode.keys() if k.startswith("label.")):
+            arr = np.asarray(episode[key])
+            features[key] = {
+                "dtype": "bool" if arr.dtype == np.bool_ else "float32",
+                "shape": tuple(arr.shape[1:]),
+                "names": None,
+            }
+
         for cam_name in self.camera_names:
             if cam_name in episode["images"] and len(episode["images"][cam_name]) > 0:
                 cam_img = episode["images"][cam_name][0]
@@ -186,6 +194,17 @@ class DataCreator:
                     f"Camera {cam_name} has {len(cam_list)} frames, expected {frame_count}"
                 )
 
+        label_arrays: Dict[str, np.ndarray] = {}
+        for key in sorted(k for k in episode.keys() if k.startswith("label.")):
+            arr = np.asarray(episode[key])
+            if len(arr) != frame_count:
+                raise ValueError(f"{key} has {len(arr)} frames, expected {frame_count}")
+            if key not in self.dataset.features:
+                raise ValueError(
+                    f"This episode provides {key} but the dataset was created without that feature."
+                )
+            label_arrays[key] = arr
+
         dataset_has_wrench = "observation.wrench" in self.dataset.features
         episode_has_wrench = "wrench" in episode
         dataset_has_velocity = "observation.velocity" in self.dataset.features
@@ -245,6 +264,13 @@ class DataCreator:
                     frame[f"observation.images.{cam_name}"] = img
                     # Release image reference to free memory
                     camera_lists[cam_name][t] = None
+
+            for key, arr in label_arrays.items():
+                value = arr[t]
+                if arr.dtype == np.bool_:
+                    frame[key] = bool(value) if value.shape == () else value
+                else:
+                    frame[key] = value.astype(np.float32, copy=False)
 
             frame["task"] = task
             self.dataset.add_frame(frame)
