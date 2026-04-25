@@ -116,6 +116,70 @@ def _build_image_msgdef() -> str:
     )
 
 
+def _build_controller_state_msgdef() -> str:
+    definitions = [
+        (
+            "aic_control_interfaces/msg/ControllerState",
+            "std_msgs/Header header\ngeometry_msgs/Pose tcp_pose",
+        ),
+        ("std_msgs/msg/Header", _load_ros2_msgdef("std_msgs/msg/Header")),
+        (
+            "builtin_interfaces/msg/Time",
+            _load_ros2_msgdef("builtin_interfaces/msg/Time"),
+        ),
+        ("geometry_msgs/msg/Pose", _load_ros2_msgdef("geometry_msgs/msg/Pose")),
+        ("geometry_msgs/msg/Point", _load_ros2_msgdef("geometry_msgs/msg/Point")),
+        (
+            "geometry_msgs/msg/Quaternion",
+            _load_ros2_msgdef("geometry_msgs/msg/Quaternion"),
+        ),
+    ]
+    return "\n================================================\n".join(
+        [
+            definitions[0][1],
+            *[
+                f"MSG: {datatype}\n{msgdef}"
+                for datatype, msgdef in definitions[1:]
+            ],
+        ]
+    )
+
+
+def _build_motion_update_msgdef() -> str:
+    definitions = [
+        (
+            "aic_control_interfaces/msg/MotionUpdate",
+            "std_msgs/Header header\n"
+            "geometry_msgs/Pose pose\n"
+            "geometry_msgs/Twist velocity\n"
+            "float64[] target_stiffness\n"
+            "float64[] target_damping",
+        ),
+        ("std_msgs/msg/Header", _load_ros2_msgdef("std_msgs/msg/Header")),
+        (
+            "builtin_interfaces/msg/Time",
+            _load_ros2_msgdef("builtin_interfaces/msg/Time"),
+        ),
+        ("geometry_msgs/msg/Pose", _load_ros2_msgdef("geometry_msgs/msg/Pose")),
+        ("geometry_msgs/msg/Point", _load_ros2_msgdef("geometry_msgs/msg/Point")),
+        (
+            "geometry_msgs/msg/Quaternion",
+            _load_ros2_msgdef("geometry_msgs/msg/Quaternion"),
+        ),
+        ("geometry_msgs/msg/Twist", _load_ros2_msgdef("geometry_msgs/msg/Twist")),
+        ("geometry_msgs/msg/Vector3", _load_ros2_msgdef("geometry_msgs/msg/Vector3")),
+    ]
+    return "\n================================================\n".join(
+        [
+            definitions[0][1],
+            *[
+                f"MSG: {datatype}\n{msgdef}"
+                for datatype, msgdef in definitions[1:]
+            ],
+        ]
+    )
+
+
 @pytest.fixture
 def tmp_dataset_root(tmp_path: Path) -> Path:
     """Empty directory that acts as a LeRobot dataset root."""
@@ -150,6 +214,9 @@ def build_mcap_fixture(tmp_path: Path):
             images={"cam_left": [(t_ns, h, w, bytes)]},
             insertion_event=[(t_ns, "/nic_card_mount_0/sfp_port_0")],
             scoring_tf=[(t_ns, [(parent, child, x,y,z, qx,qy,qz,qw)])],
+            controller_state=[(t_ns, x,y,z, qx,qy,qz,qw)],
+            tf=[(t_ns, [(parent, child, x,y,z, qx,qy,qz,qw)])],
+            pose_commands=[(t_ns, x,y,z, qx,qy,qz,qw, vx,vy,vz, wx,wy,wz, stiffness, damping)],
         )
     """
 
@@ -162,6 +229,9 @@ def build_mcap_fixture(tmp_path: Path):
         images=None,
         insertion_event=None,
         scoring_tf=None,
+        controller_state=None,
+        tf=None,
+        pose_commands=None,
     ) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
@@ -196,7 +266,12 @@ def build_mcap_fixture(tmp_path: Path):
                 if joint_state_topics:
                     joint_state_topics_to_write.update(joint_state_topics)
                 for topic, messages in joint_state_topics_to_write.items():
-                    for t_ns, names, positions in messages:
+                    for item in messages:
+                        if len(item) == 3:
+                            t_ns, names, positions = item
+                            velocities = [0.0] * len(names)
+                        else:
+                            t_ns, names, positions, velocities = item
                         queue_message(
                             t_ns,
                             0,
@@ -212,7 +287,7 @@ def build_mcap_fixture(tmp_path: Path):
                                 },
                                 "name": list(names),
                                 "position": list(positions),
-                                "velocity": [0.0] * len(names),
+                                "velocity": list(velocities),
                                 "effort": [0.0] * len(names),
                             },
                         )
@@ -260,6 +335,93 @@ def build_mcap_fixture(tmp_path: Path):
                         "/scoring/tf",
                         tf_schema,
                         {"transforms": tf_msgs},
+                    )
+            if controller_state:
+                controller_schema = writer.register_msgdef(
+                    datatype="aic_control_interfaces/msg/ControllerState",
+                    msgdef_text=_build_controller_state_msgdef(),
+                )
+                for t_ns, x, y, z, qx, qy, qz, qw in controller_state:
+                    queue_message(
+                        t_ns,
+                        30,
+                        "/aic_controller/controller_state",
+                        controller_schema,
+                        {
+                            "header": {
+                                "stamp": {
+                                    "sec": t_ns // 1_000_000_000,
+                                    "nanosec": t_ns % 1_000_000_000,
+                                },
+                                "frame_id": "base_link",
+                            },
+                            "tcp_pose": {
+                                "position": {"x": x, "y": y, "z": z},
+                                "orientation": {"x": qx, "y": qy, "z": qz, "w": qw},
+                            },
+                        },
+                    )
+            if tf:
+                tf_schema = tf_schema or writer.register_msgdef(
+                    datatype="tf2_msgs/msg/TFMessage",
+                    msgdef_text=_build_tf_message_msgdef(),
+                )
+                for t_ns, transforms in tf:
+                    tf_msgs = []
+                    for parent, child, x, y, z, qx, qy, qz, qw in transforms:
+                        tf_msgs.append(
+                            {
+                                "header": {
+                                    "stamp": {
+                                        "sec": t_ns // 1_000_000_000,
+                                        "nanosec": t_ns % 1_000_000_000,
+                                    },
+                                    "frame_id": parent,
+                                },
+                                "child_frame_id": child,
+                                "transform": {
+                                    "translation": {"x": x, "y": y, "z": z},
+                                    "rotation": {"x": qx, "y": qy, "z": qz, "w": qw},
+                                },
+                            }
+                        )
+                    queue_message(t_ns, 40, "/tf", tf_schema, {"transforms": tf_msgs})
+            if pose_commands:
+                motion_schema = writer.register_msgdef(
+                    datatype="aic_control_interfaces/msg/MotionUpdate",
+                    msgdef_text=_build_motion_update_msgdef(),
+                )
+                for (
+                    t_ns,
+                    x, y, z, qx, qy, qz, qw,
+                    vx, vy, vz, wx, wy, wz,
+                    stiffness,
+                    damping,
+                ) in pose_commands:
+                    queue_message(
+                        t_ns,
+                        50,
+                        "/aic_controller/pose_commands",
+                        motion_schema,
+                        {
+                            "header": {
+                                "stamp": {
+                                    "sec": t_ns // 1_000_000_000,
+                                    "nanosec": t_ns % 1_000_000_000,
+                                },
+                                "frame_id": "base_link",
+                            },
+                            "pose": {
+                                "position": {"x": x, "y": y, "z": z},
+                                "orientation": {"x": qx, "y": qy, "z": qz, "w": qw},
+                            },
+                            "velocity": {
+                                "linear": {"x": vx, "y": vy, "z": vz},
+                                "angular": {"x": wx, "y": wy, "z": wz},
+                            },
+                            "target_stiffness": list(stiffness),
+                            "target_damping": list(damping),
+                        },
                     )
             if wrench:
                 wrench_schema = writer.register_msgdef(
