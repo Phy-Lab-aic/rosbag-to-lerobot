@@ -91,6 +91,34 @@ def test_load_validation_status_rejects_non_list_checks(tmp_path: Path):
     assert result["reason"] == "validation.json invalid: checks must be list"
 
 
+def test_load_validation_status_rejects_non_object_check(tmp_path: Path):
+    (tmp_path / "validation.json").write_text(
+        json.dumps({"passed_count": 1, "total_count": 1, "checks": ["config.yaml"]})
+    )
+
+    result = load_validation_status(tmp_path)
+
+    assert result["passed"] is False
+    assert result["reason"] == "validation.json invalid: check must be object"
+
+
+def test_load_validation_status_rejects_check_missing_passed(tmp_path: Path):
+    (tmp_path / "validation.json").write_text(
+        json.dumps(
+            {
+                "passed_count": 1,
+                "total_count": 1,
+                "checks": [{"name": "config.yaml"}],
+            }
+        )
+    )
+
+    result = load_validation_status(tmp_path)
+
+    assert result["passed"] is False
+    assert result["reason"] == "validation.json invalid: check missing passed"
+
+
 def test_load_validation_status_rejects_invalid_json(tmp_path: Path):
     (tmp_path / "validation.json").write_text("{")
 
@@ -98,3 +126,12 @@ def test_load_validation_status_rejects_invalid_json(tmp_path: Path):
 
     assert result["passed"] is False
     assert result["reason"] == "validation.json invalid json"
+
+
+def test_load_validation_status_rejects_unreadable_file(tmp_path: Path):
+    (tmp_path / "validation.json").mkdir()
+
+    result = load_validation_status(tmp_path)
+
+    assert result["passed"] is False
+    assert result["reason"] == "validation.json unreadable"
