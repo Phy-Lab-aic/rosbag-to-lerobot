@@ -2,15 +2,47 @@
 
 Replaces ConversionNode (ROS2 Action Server) with a standalone Python script.
 Reads JSON config, iterates folders, and produces LeRobot v3 datasets.
+
+Supports two modes:
+  - Convert:  python main.py config.json --input-dir /bags --output-dir /out
+  - Merge:    python main.py config.json --input-dir /bags --output-dir /existing/dataset --merge
 """
 
+import argparse
+import gc
 import json
 import logging
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import pyarrow.parquet as pq
+
+from v3_conversion.action_shift import apply_one_step_shift
+from v3_conversion.aic_meta.scoring_mcap import (
+    extract_insertion_event,
+    extract_scoring_tf_snapshots,
+)
+from v3_conversion.aic_meta.pose_commands import extract_pose_commands
+from v3_conversion.aic_meta.pose_labels import extract_pose_labels
+from v3_conversion.aic_meta.sources import (
+    load_episode_metadata,
+    load_run_meta,
+    load_scene_from_config,
+    load_scoring_yaml,
+    load_tags,
+    load_validation_status,
+)
+from v3_conversion.aic_meta.task_string import build_task_string
+from v3_conversion.aic_meta.writer import (
+    write_pose_commands_parquet,
+    write_scene_parquet,
+    write_scoring_parquet,
+    write_task_parquet,
+    write_tf_snapshots_parquet,
+)
 from v3_conversion.constants import CONFIG_PATH, INPUT_PATH, OUTPUT_PATH
 from v3_conversion.data_converter import frames_to_episode
 from v3_conversion.data_creator import DataCreator
@@ -24,6 +56,21 @@ from v3_conversion.mcap_reader import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = CONFIG_PATH
+
+
+@dataclass(frozen=True)
+class EpisodeContext:
+    episode_dir: Path
+    trial_dir: Optional[Path]
+    trial_key: str
+    trial_score_folder: str
+
+
+def _load_existing_parquet_rows(path: Path) -> List[Dict[str, Any]]:
+    """Read existing parquet rows so merge mode appends instead of overwriting."""
+    if not path.is_file():
+        return []
+    return pq.read_table(path).to_pylist()
 
 
 # ------------------------------------------------------------------
@@ -74,6 +121,7 @@ def _load_config(config_path: str) -> dict:
         "camera_topic_map": config.get("camera_topic_map", {}),
         "joint_names": config.get("joint_names", []),
         "state_topic": config.get("state_topic", ""),
+        "wrench_topic": config.get("wrench_topic", ""),
         "action_topics_map": config.get("action_topics_map", {}),
         "task_instruction": config.get("task_instruction", []),
         "tags": config.get("tags", []),
@@ -122,6 +170,7 @@ def _load_metacard(
         "joint_names": metacard.get("joint_names", defaults.get("joint_names", [])),
         "action_topics_map": metacard.get("action_topics_map", defaults.get("action_topics_map", {})),
         "state_topic": metacard.get("state_topic", defaults.get("state_topic", "")),
+        "wrench_topic": metacard.get("wrench_topic", defaults.get("wrench_topic", "")),
     }
 
 
@@ -145,6 +194,30 @@ def _find_mcap(folder_name: str) -> Path:
         return mcaps[0]
 
     raise FileNotFoundError(f"No MCAP file found in {folder_dir}")
+
+
+def _find_episode_context(run_dir: Path) -> Optional[EpisodeContext]:
+    """Return episode metadata context, preferring trial metadata over root."""
+    for trial_dir in sorted(run_dir.glob("trial_*")):
+        episode_dir = trial_dir / "episode"
+        if (episode_dir / "metadata.json").is_file():
+            return EpisodeContext(
+                episode_dir=episode_dir,
+                trial_dir=trial_dir,
+                trial_key=trial_dir.name.split("_score")[0],
+                trial_score_folder=trial_dir.name,
+            )
+
+    root_episode = run_dir / "episode"
+    if (root_episode / "metadata.json").is_file():
+        return EpisodeContext(
+            episode_dir=root_episode,
+            trial_dir=None,
+            trial_key="",
+            trial_score_folder="",
+        )
+
+    return None
 
 
 def _prepare_config(
@@ -217,11 +290,33 @@ def _prepare_config(
 # Main conversion
 # ------------------------------------------------------------------
 
-def run_conversion(config_path: str) -> int:
+def run_conversion(
+    config_path: str,
+    input_dir: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    merge: bool = False,
+) -> int:
     """Run the full conversion pipeline.
+
+    Parameters
+    ----------
+    input_dir : str, optional
+        Override INPUT_PATH (where bag folders live).
+    output_dir : str, optional
+        Override OUTPUT_PATH.  When *merge* is True this must point to an
+        existing LeRobot dataset directory.
+    merge : bool
+        When True, use *output_dir* as-is (no task_name subdirectory) and
+        append episodes to the existing dataset found there.
 
     Returns exit code: 0=success, 1=all failed, 2=partial success.
     """
+    global INPUT_PATH
+    if input_dir is not None:
+        INPUT_PATH = Path(input_dir)
+
+    effective_output = Path(output_dir) if output_dir else OUTPUT_PATH
+
     cfg = _load_config(config_path)
     task_name = cfg["task_name"]
     repo_id = cfg["repo_id"] or task_name
@@ -236,6 +331,7 @@ def run_conversion(config_path: str) -> int:
         "camera_topic_map": cfg.get("camera_topic_map", {}),
         "joint_names": cfg.get("joint_names", []),
         "state_topic": cfg.get("state_topic", ""),
+        "wrench_topic": cfg.get("wrench_topic", ""),
         "action_topics_map": cfg.get("action_topics_map", {}),
         "task_instruction": cfg.get("task_instruction", []),
         "tags": cfg.get("tags", []),
@@ -245,18 +341,88 @@ def run_conversion(config_path: str) -> int:
         logger.error("No folders to convert")
         return 1
 
-    logger.info("Starting conversion: task=%s, folders=%d", task_name, len(folders))
+    next_episode_index = 0
+    if merge:
+        output_root = str(effective_output)
+        meta_info = effective_output / "meta" / "info.json"
+        if not meta_info.is_file():
+            logger.error(
+                "Merge target is not an existing LeRobot dataset: %s "
+                "(meta/info.json not found)", effective_output,
+            )
+            return 1
 
-    output_root = str(OUTPUT_PATH / task_name)
+        with open(meta_info, "r", encoding="utf-8") as _f:
+            existing_info = json.load(_f)
+        existing_features = existing_info.get("features", {})
+        existing_obs_shape = existing_features.get("observation.state", {}).get("shape", [])
+        config_obs_dim = len(config_defaults["joint_names"])
+
+        if existing_obs_shape and existing_obs_shape[0] != config_obs_dim:
+            logger.error(
+                "Feature mismatch: existing dataset has observation.state shape %s "
+                "but config has %d joints (%s). "
+                "Adjust joint_names in config to match.",
+                existing_obs_shape, config_obs_dim, config_defaults["joint_names"],
+            )
+            return 1
+
+        next_episode_index = int(existing_info.get("total_episodes", 0))
+        logger.info(
+            "MERGE mode: appending to existing dataset at %s "
+            "(existing episodes=%s, fps=%s)",
+            output_root,
+            existing_info.get("total_episodes", "?"),
+            existing_info.get("fps", "?"),
+        )
+    else:
+        output_root = str(effective_output / task_name)
+
+    aic_dir = Path(output_root) / "meta" / "aic"
+
+    logger.info("Starting conversion: task=%s, folders=%d", task_name, len(folders))
     creator: Optional[DataCreator] = None
     converted_count = 0
     failed_count = 0
+    skipped_count = 0
     failed_folders: List[str] = []
+    skipped_reasons: List[str] = []
+    if merge:
+        aic_task_rows = _load_existing_parquet_rows(aic_dir / "task.parquet")
+        aic_scoring_rows = _load_existing_parquet_rows(aic_dir / "scoring.parquet")
+        aic_scene_rows = _load_existing_parquet_rows(aic_dir / "scene.parquet")
+        aic_tf_rows = _load_existing_parquet_rows(aic_dir / "tf_snapshots.parquet")
+        aic_pose_command_rows = _load_existing_parquet_rows(
+            aic_dir / "pose_commands.parquet"
+        )
+    else:
+        aic_task_rows = []
+        aic_scoring_rows = []
+        aic_scene_rows = []
+        aic_tf_rows = []
+        aic_pose_command_rows = []
 
     for idx, folder_name in enumerate(folders):
         logger.info("[%d/%d] Converting: %s", idx + 1, len(folders), folder_name)
 
         try:
+            run_dir = INPUT_PATH / folder_name
+            validation_status = load_validation_status(run_dir)
+            if not validation_status.get("passed", False):
+                skipped_count += 1
+                reason = str(validation_status.get("reason", "validation failed"))
+                skipped_reasons.append(f"{folder_name}: {reason}")
+                logger.info("  Skipped %s: %s", folder_name, reason)
+                continue
+
+            episode_context = _find_episode_context(run_dir)
+            if episode_context is None:
+                skipped_count += 1
+                reason = "episode/metadata.json missing"
+                skipped_reasons.append(f"{folder_name}: {reason}")
+                logger.info("  Skipped %s: %s", folder_name, reason)
+                continue
+
             # 1. Load metacard (falls back to config defaults)
             metadata = _load_metacard(folder_name, config_defaults)
 
@@ -265,7 +431,19 @@ def run_conversion(config_path: str) -> int:
                 folder_name, metadata, robot_type, fps_override
             )
 
-            # 3. Initialize DataCreator on first successful config
+            # 3. Pre-check: all expected topics exist in MCAP
+            validation = validate_mcap_topics(str(mcap_path), config.topic_map)
+            if validation["missing_topics"]:
+                skipped_count += 1
+                reason = (
+                    "missing required MCAP topics: "
+                    f"{validation['missing_topics']}"
+                )
+                skipped_reasons.append(f"{folder_name}: {reason}")
+                logger.info("  Skipped %s: %s", folder_name, reason)
+                continue
+
+            # 4. Initialize DataCreator on first run that will extract frames
             if creator is None:
                 creator = DataCreator(
                     repo_id=repo_id,
@@ -275,14 +453,6 @@ def run_conversion(config_path: str) -> int:
                     joint_order=config.joint_order,
                     camera_names=config.camera_names,
                     fps=config.fps,
-                )
-
-            # 4. Pre-check: all expected topics exist in MCAP
-            validation = validate_mcap_topics(str(mcap_path), config.topic_map)
-            if validation["missing_topics"]:
-                raise ValueError(
-                    f"MCAP topic pre-check failed [folder={folder_name}]: "
-                    f"missing {validation['missing_topics']}"
                 )
 
             # 5. Extract frames
@@ -312,29 +482,99 @@ def run_conversion(config_path: str) -> int:
                     f"(missing leader topics or action key mismatch)."
                 )
 
-            # 7. Transform to episode (with task_instruction extraction)
-            task_instruction = "default_task"
-            ti = metadata.get("task_instruction")
-            if ti and isinstance(ti, list) and len(ti) > 0 and ti[0]:
-                task_instruction = ti[0]
+            frame_timestamps_ns = [
+                int(frame["emitted_timestamp_ns"]) for frame in frames
+            ]
 
+            # 7. Transform to episode with task derived from episode metadata
+            episode_meta = load_episode_metadata(episode_context.episode_dir)
+            task_instruction = build_task_string(episode_meta)
+
+            trial_dir = episode_context.trial_dir or run_dir
+            trial_key = episode_context.trial_key
+            run_meta = load_run_meta(run_dir)
+            tags_meta = load_tags(trial_dir)
+            scoring_meta = load_scoring_yaml(trial_dir, trial_key=trial_key)
+            scene_meta = load_scene_from_config(run_dir, trial_key=trial_key)
+            episode_start_ns = frame_timestamps_ns[0]
+            pose_labels = extract_pose_labels(
+                bag_path=mcap_path,
+                frame_timestamps_ns=frame_timestamps_ns,
+                episode_meta=episode_meta,
+                base_frame="base_link",
+            )
+            insertion_meta = extract_insertion_event(
+                mcap_path, episode_start_ns=episode_start_ns,
+            )
+            tf_snapshots = extract_scoring_tf_snapshots(mcap_path)
+            ep_idx = next_episode_index
+            pose_command_rows = extract_pose_commands(
+                bag_path=mcap_path,
+                episode_index=ep_idx,
+                episode_start_ns=episode_start_ns,
+            )
+            task_row = {
+                "episode_index": ep_idx,
+                "run_folder": folder_name,
+                "trial_key": trial_key,
+                "trial_score_folder": episode_context.trial_score_folder,
+                "schema_version": tags_meta["schema_version"],
+                "cable_type": episode_meta["cable_type"],
+                "cable_name": episode_meta["cable_name"],
+                "plug_type": episode_meta["plug_type"],
+                "plug_name": episode_meta["plug_name"],
+                "port_type": episode_meta["port_type"],
+                "port_name": episode_meta["port_name"],
+                "target_module": episode_meta["target_module"],
+                "success": bool(episode_meta["success"]),
+                "early_terminated": bool(episode_meta["early_terminated"]),
+                "early_term_source": episode_meta["early_term_source"],
+                "duration_sec": float(episode_meta["duration_sec"]),
+                "num_steps": int(episode_meta["num_steps"]),
+                "policy": run_meta["policy"],
+                "seed": int(run_meta["seed"]),
+                **insertion_meta,
+            }
+            scoring_row = {"episode_index": ep_idx, **scoring_meta}
+            scene_row = {
+                "episode_index": ep_idx,
+                "plug_port_distance_init": float(
+                    episode_meta["plug_port_distance_init"]
+                ),
+                "initial_plug_pose_rel_gripper":
+                    scene_meta["initial_plug_pose_rel_gripper"],
+                "scene_rails": scene_meta["scene_rails"],
+            }
+            tf_row = {
+                "episode_index": ep_idx,
+                **tf_snapshots,
+            }
+            del timestamps
+
+            # frames_to_episode consumes and clears the frames list
             episode = frames_to_episode(
                 frames=frames,
                 action_order=config.action_order,
                 camera_names=config.camera_names,
                 task=task_instruction,
             )
+            del frames
+            episode.update(pose_labels)
+            episode = apply_one_step_shift(episode)
 
-            # 8. Convert episode with custom metadata
-            custom_metadata = {
-                "Serial_number": folder_name,
-                "tags": metadata.get("tags", []),
-                "grade": "",
-            }
-            creator.convert_episode(episode, custom_metadata=custom_metadata)
+            # 8. Convert episode
+            creator.convert_episode(episode)
+            del episode
+            aic_task_rows.append(task_row)
+            aic_scoring_rows.append(scoring_row)
+            aic_scene_rows.append(scene_row)
+            aic_tf_rows.append(tf_row)
+            aic_pose_command_rows.extend(pose_command_rows)
+            next_episode_index += 1
 
             converted_count += 1
             logger.info("  Converted successfully: %s", folder_name)
+            gc.collect()
 
         except Exception as e:
             failed_count += 1
@@ -349,7 +589,9 @@ def run_conversion(config_path: str) -> int:
                     creator.dataset = None
 
     # Finalize dataset
+    finalize_failed = False
     if creator is not None and creator.dataset is not None:
+        finalize_ok = False
         try:
             creator.dataset.finalize()
             logger.info("Dataset finalized")
@@ -357,11 +599,24 @@ def run_conversion(config_path: str) -> int:
             logger.info("Video timestamps corrected")
             creator.patch_episodes_metadata()
             logger.info("Episode custom metadata patched")
+            write_task_parquet(aic_dir / "task.parquet", aic_task_rows)
+            write_scoring_parquet(aic_dir / "scoring.parquet", aic_scoring_rows)
+            write_scene_parquet(aic_dir / "scene.parquet", aic_scene_rows)
+            write_tf_snapshots_parquet(aic_dir / "tf_snapshots.parquet", aic_tf_rows)
+            write_pose_commands_parquet(
+                aic_dir / "pose_commands.parquet", aic_pose_command_rows
+            )
+            finalize_ok = True
         except Exception as e:
-            logger.error("Failed to finalize dataset: %s", e)
+            finalize_failed = True
+            logger.error("Failed to finalize dataset or write AIC metadata: %s", e)
 
         # Push to HuggingFace Hub if repo_id has namespace format
-        if "/" in repo_id:
+        if not finalize_ok:
+            logger.warning(
+                "Skipping push_to_hub because dataset finalization or AIC metadata write failed."
+            )
+        elif "/" in repo_id:
             try:
                 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -379,14 +634,19 @@ def run_conversion(config_path: str) -> int:
 
     # Summary
     logger.info(
-        "Conversion complete: %d converted, %d failed", converted_count, failed_count
+        "Conversion complete: %d converted, %d failed, %d skipped",
+        converted_count,
+        failed_count,
+        skipped_count,
     )
     if failed_folders:
         logger.info("Failed folders: %s", failed_folders)
+    if skipped_reasons:
+        logger.info("Skipped folders: %s", skipped_reasons)
 
     if converted_count == 0:
         return 1
-    if failed_count > 0:
+    if failed_count > 0 or finalize_failed:
         return 2
     return 0
 
@@ -397,8 +657,34 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    config_path = sys.argv[1] if len(sys.argv) > 1 else str(DEFAULT_CONFIG)
-    exit_code = run_conversion(config_path)
+    parser = argparse.ArgumentParser(
+        description="Convert MCAP ROS2 bags to LeRobot v3 dataset",
+    )
+    parser.add_argument(
+        "config", nargs="?", default=str(DEFAULT_CONFIG),
+        help="Path to config.json (default: src/config.json)",
+    )
+    parser.add_argument(
+        "--input-dir",
+        help="Directory containing bag folders (overrides INPUT_PATH env/default)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Output directory. In merge mode, must be an existing LeRobot dataset.",
+    )
+    parser.add_argument(
+        "--merge", action="store_true",
+        help="Append episodes to the existing dataset at --output-dir "
+             "(no task_name subdirectory created)",
+    )
+    args = parser.parse_args()
+
+    exit_code = run_conversion(
+        config_path=args.config,
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        merge=args.merge,
+    )
     sys.exit(exit_code)
 
 

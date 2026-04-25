@@ -36,6 +36,20 @@ def _handle_joint_state(msg_data, joint_order: List[str]) -> np.ndarray:
     return np.array(ordered, dtype=np.float32)
 
 
+def _handle_joint_state_velocity(msg_data, joint_order: List[str]) -> np.ndarray | None:
+    """Extract JointState velocity in canonical joint order."""
+    velocities = getattr(msg_data, "velocity", None)
+    if not velocities:
+        return None
+
+    velocity_map = dict(zip(msg_data.name, velocities))
+    missing = [name for name in joint_order if name not in velocity_map]
+    if missing:
+        raise KeyError(f"Missing joints in JointState velocity: {missing}")
+    ordered = [velocity_map[name] for name in joint_order]
+    return np.array(ordered, dtype=np.float32)
+
+
 def _handle_odometry(msg_data, joint_order: List[str]) -> np.ndarray:
     """Handle nav_msgs/msg/Odometry.
 
@@ -88,8 +102,30 @@ def _handle_controller_state(msg_data, joint_order: List[str]) -> np.ndarray:
         raise ValueError(
             f"ControllerState.reference_joint_state has {len(positions)} "
             f"positions but joint_order expects {len(joint_order)}"
-        )
+    )
     return np.array(positions, dtype=np.float32)
+
+
+def _handle_wrench_stamped(msg_data, joint_order) -> np.ndarray:
+    """Handle geometry_msgs/msg/WrenchStamped -> [Fx,Fy,Fz,Tx,Ty,Tz]."""
+    w = msg_data.wrench
+    result = np.array(
+        [
+            w.force.x,
+            w.force.y,
+            w.force.z,
+            w.torque.x,
+            w.torque.y,
+            w.torque.z,
+        ],
+        dtype=np.float32,
+    )
+    if joint_order and len(joint_order) != len(result):
+        raise ValueError(
+            f"WrenchStamped produces {len(result)} values but joint_order "
+            f"expects {len(joint_order)}: {joint_order}"
+        )
+    return result
 
 
 _JOINT_HANDLERS = {
@@ -98,6 +134,7 @@ _JOINT_HANDLERS = {
     "nav_msgs/msg/Odometry": _handle_odometry,
     "geometry_msgs/msg/Twist": _handle_twist,
     "aic_control_interfaces/msg/ControllerState": _handle_controller_state,
+    "geometry_msgs/msg/WrenchStamped": _handle_wrench_stamped,
 }
 
 
@@ -209,6 +246,7 @@ def build_frame(
     joint_order: Dict[str, Any],
     rot_img: bool,
     schema_map: Dict[str, str],
+    wrench_msg: Any | None = None,
 ) -> Dict[str, Any] | None:
     """Convert accumulated deserialized messages into a single frame dict.
 
@@ -238,6 +276,12 @@ def build_frame(
             )
     follower_data = np.concatenate(follower_arrays) if follower_arrays else np.array([], dtype=np.float32)
 
+    velocity_data = None
+    obs_msg = (follower_msgs or {}).get("observation")
+    obs_schema = schema_map.get("observation", "")
+    if obs_msg is not None and obs_schema == "sensor_msgs/msg/JointState":
+        velocity_data = _handle_joint_state_velocity(obs_msg, joint_order["obs"])
+
     # -- action (leader) --
     leader_joint_order = joint_order.get("action")
     if leader_msgs is None or leader_joint_order is None:
@@ -256,7 +300,13 @@ def build_frame(
             if "wrist" in k:
                 camera_data[k] = v[::-1, ::-1].copy()
 
-    return {"images": camera_data, "obs": follower_data, "action": action_data}
+    result = {"images": camera_data, "obs": follower_data, "action": action_data}
+    if velocity_data is not None:
+        result["velocity"] = velocity_data
+    if wrench_msg is not None:
+        wrench_schema = schema_map.get("wrench", "geometry_msgs/msg/WrenchStamped")
+        result["wrench"] = _convert_joint_msg(wrench_msg, None, wrench_schema)
+    return result
 
 
 def frames_to_episode(
@@ -269,8 +319,12 @@ def frames_to_episode(
     obs_list = []
     action_lists = {key: [] for key in action_order}
     camera_lists = {cam: [] for cam in camera_names}
+    velocity_list: list = []
+    wrench_list: list = []
 
-    for f in frames:
+    # Pop frames from the input list to free memory as we consume them
+    while frames:
+        f = frames.pop(0)
         obs_list.append(np.asarray(f["obs"], dtype=np.float32))
 
         action = f["action"]
@@ -282,12 +336,40 @@ def frames_to_episode(
             if cam in imgs:
                 camera_lists[cam].append(imgs[cam])
 
+        if "velocity" in f:
+            velocity_list.append(np.asarray(f["velocity"], dtype=np.float32))
+
+        if "wrench" in f:
+            wrench_list.append(np.asarray(f["wrench"], dtype=np.float32))
+
+        f.clear()
+
+    if velocity_list and len(velocity_list) != len(obs_list):
+        raise ValueError(
+            "frames_to_episode requires velocity to be present in every frame "
+            "or in none of them"
+        )
+
+    if wrench_list and len(wrench_list) != len(obs_list):
+        raise ValueError(
+            "frames_to_episode requires wrench to be present in every frame "
+            "or in none of them"
+        )
+
     episode = {
         "obs": np.stack(obs_list, axis=0),
         "images": camera_lists,
         "task": task,
     }
+    del obs_list
     for key in action_order:
         episode[key] = np.stack(action_lists[key], axis=0)
+    del action_lists
+
+    if velocity_list:
+        episode["velocity"] = np.stack(velocity_list, axis=0)
+
+    if wrench_list:
+        episode["wrench"] = np.stack(wrench_list, axis=0)
 
     return episode
