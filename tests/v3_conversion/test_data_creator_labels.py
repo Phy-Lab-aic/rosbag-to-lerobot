@@ -133,3 +133,25 @@ def test_data_creator_rejects_label_when_dataset_does_not_expect_it(
 
     with pytest.raises(ValueError, match="label\\.tcp_pose"):
         creator.convert_episode(episode)
+
+
+def test_data_creator_rejects_missing_label_when_dataset_expects_it(
+    tmp_dataset_root,
+):
+    creator = _make_creator(tmp_dataset_root)
+    creator.dataset = _DummyLeRobotDataset(
+        {
+            "observation.state": {"dtype": "float32", "shape": (1,), "names": ["j0"]},
+            "action": {"dtype": "float32", "shape": (1,), "names": ["j0"]},
+            "label.tcp_pose": {"dtype": "float32", "shape": (7,), "names": None},
+        }
+    )
+    episode = {
+        "obs": np.array([[0.0], [0.2]], dtype=np.float32),
+        "action": np.array([[0.2], [0.4]], dtype=np.float32),
+        "images": {},
+        "task": "Insert cable.",
+    }
+
+    with pytest.raises(ValueError, match="label features missing"):
+        creator.convert_episode(episode)

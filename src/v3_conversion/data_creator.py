@@ -194,8 +194,21 @@ class DataCreator:
                     f"Camera {cam_name} has {len(cam_list)} frames, expected {frame_count}"
                 )
 
+        expected_label_features = {
+            key for key in self.dataset.features if key.startswith("label.")
+        }
+        provided_label_keys = {
+            key for key in episode.keys() if key.startswith("label.")
+        }
+        missing_label_features = sorted(expected_label_features - provided_label_keys)
+        if missing_label_features:
+            raise ValueError(
+                "label features missing from episode: "
+                + ", ".join(missing_label_features)
+            )
+
         label_arrays: Dict[str, np.ndarray] = {}
-        for key in sorted(k for k in episode.keys() if k.startswith("label.")):
+        for key in sorted(provided_label_keys):
             arr = np.asarray(episode[key])
             if len(arr) != frame_count:
                 raise ValueError(f"{key} has {len(arr)} frames, expected {frame_count}")
