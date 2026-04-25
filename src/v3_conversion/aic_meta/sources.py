@@ -199,3 +199,32 @@ def load_scene_from_config(run_dir: Path, trial_key: str) -> Dict[str, Any]:
         ]
 
     return result
+
+
+def load_validation_status(run_dir: Path) -> Dict[str, Any]:
+    """Return whether validation.json permits conversion for a run."""
+    path = run_dir / "validation.json"
+    if not path.is_file():
+        return {"passed": False, "reason": "validation.json missing"}
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as exc:
+        return {"passed": False, "reason": f"validation.json unreadable: {exc}"}
+
+    checks = raw.get("checks") or []
+    for check in checks:
+        if isinstance(check, dict) and check.get("passed") is False:
+            name = str(check.get("name", "unnamed"))
+            return {"passed": False, "reason": f"validation.json failed check: {name}"}
+
+    passed_count = raw.get("passed_count")
+    total_count = raw.get("total_count")
+    if passed_count is not None and total_count is not None and passed_count != total_count:
+        return {
+            "passed": False,
+            "reason": f"validation.json passed_count {passed_count} != total_count {total_count}",
+        }
+
+    return {"passed": True, "reason": ""}
