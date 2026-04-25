@@ -76,28 +76,28 @@ def extract_pose_commands(
                         continue
                     try:
                         msg = decoder(record.data)
+                        t_ns = int(record.log_time)
+                        rows.append(
+                            {
+                                "episode_index": int(episode_index),
+                                "t_ns": t_ns,
+                                "time_sec": float(
+                                    (t_ns - episode_start_ns) / 1_000_000_000
+                                ),
+                                "pose": _pose_list(msg.pose),
+                                "velocity": _twist_list(msg.velocity),
+                                "stiffness": [
+                                    float(x)
+                                    for x in getattr(msg, "target_stiffness", [])
+                                ],
+                                "damping": [
+                                    float(x)
+                                    for x in getattr(msg, "target_damping", [])
+                                ],
+                            }
+                        )
                     except Exception:
                         continue
-                    t_ns = int(record.log_time)
-                    rows.append(
-                        {
-                            "episode_index": int(episode_index),
-                            "t_ns": t_ns,
-                            "time_sec": float(
-                                (t_ns - episode_start_ns) / 1_000_000_000
-                            ),
-                            "pose": _pose_list(msg.pose),
-                            "velocity": _twist_list(msg.velocity),
-                            "stiffness": [
-                                float(x)
-                                for x in getattr(msg, "target_stiffness", [])
-                            ],
-                            "damping": [
-                                float(x)
-                                for x in getattr(msg, "target_damping", [])
-                            ],
-                        }
-                    )
     except Exception:
         return rows
     return rows
