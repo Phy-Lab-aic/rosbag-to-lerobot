@@ -229,6 +229,7 @@ def build_mcap_fixture(tmp_path: Path):
         images=None,
         insertion_event=None,
         scoring_tf=None,
+        scoring_tf_topic="/scoring/tf",
         controller_state=None,
         tf=None,
         pose_commands=None,
@@ -332,7 +333,7 @@ def build_mcap_fixture(tmp_path: Path):
                     queue_message(
                         t_ns,
                         20,
-                        "/scoring/tf",
+                        scoring_tf_topic,
                         tf_schema,
                         {"transforms": tf_msgs},
                     )

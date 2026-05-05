@@ -82,6 +82,39 @@ def test_convert_episode_emits_wrench_frames(tmp_dataset_root):
     )
 
 
+def test_convert_episode_emits_pose_label_frames(tmp_dataset_root):
+    creator = _make_creator(tmp_dataset_root)
+    episode = {
+        "obs": np.zeros((2, 1), dtype=np.float32),
+        "action": np.zeros((2, 1), dtype=np.float32),
+        "images": {},
+        "label.plug_pose_base": np.array(
+            [
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        "label.plug_pose_base_valid": np.array([[True], [False]], dtype=np.bool_),
+        "label.port_pose_base": np.zeros((2, 7), dtype=np.float32),
+        "label.port_pose_base_valid": np.ones((2, 1), dtype=np.bool_),
+        "label.target_module_pose_base": np.zeros((2, 7), dtype=np.float32),
+        "label.target_module_pose_base_valid": np.ones((2, 1), dtype=np.bool_),
+        "task": "t",
+    }
+
+    creator.convert_episode(episode)
+
+    assert "label.plug_pose_base" in creator.dataset.features
+    assert "label.plug_pose_base_valid" in creator.dataset.features
+    assert len(creator.dataset.frames) == 2
+    assert np.allclose(
+        creator.dataset.frames[0]["label.plug_pose_base"],
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    )
+    assert creator.dataset.frames[1]["label.plug_pose_base_valid"].tolist() == [False]
+
+
 def test_convert_episode_rejects_wrench_when_dataset_does_not_expect_it(
     tmp_dataset_root,
 ):

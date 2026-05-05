@@ -159,6 +159,37 @@ def test_scoring_tf_snapshots_return_empty_for_unreadable_bag(tmp_path: Path):
     assert result == {"scoring_frames_initial": [], "scoring_frames_final": []}
 
 
+def test_scoring_tf_snapshots_accept_tf_scoring_alias(
+    build_mcap_fixture, tmp_path: Path
+):
+    bag = build_mcap_fixture(
+        path=tmp_path / "alias.mcap",
+        scoring_tf_topic="/tf/scoring",
+        scoring_tf=[
+            (
+                0,
+                [
+                    (
+                        "world",
+                        "task_board",
+                        0.15,
+                        -0.20,
+                        1.14,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    )
+                ],
+            )
+        ],
+    )
+
+    result = extract_scoring_tf_snapshots(bag)
+
+    assert result["scoring_frames_initial"][0]["frame_id"] == "task_board"
+
+
 def test_scoring_tf_snapshots_return_fresh_empty_lists_per_call(tmp_path: Path):
     bag = tmp_path / "broken.mcap"
     bag.write_bytes(b"not a valid mcap file")

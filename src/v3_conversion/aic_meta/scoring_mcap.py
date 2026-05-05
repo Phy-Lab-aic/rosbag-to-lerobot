@@ -7,6 +7,8 @@ from typing import Any, Deque, Dict
 from mcap.stream_reader import StreamReader
 from mcap_ros2.decoder import DecoderFactory
 
+SCORING_TF_TOPICS = {"/scoring/tf", "/tf/scoring"}
+
 
 _DEFAULT_RESULT = {
     "insertion_event_fired": False,
@@ -67,7 +69,7 @@ def extract_insertion_event(
 
 
 def _collect_tf_messages(bag_path: Path):
-    """Yield ``(log_time_ns, msg)`` for every ``/scoring/tf`` message."""
+    """Yield ``(log_time_ns, msg)`` for every scoring TF message."""
     factory = DecoderFactory()
     schemas: dict[int, Any] = {}
     channels: dict[int, Any] = {}
@@ -83,7 +85,7 @@ def _collect_tf_messages(bag_path: Path):
                     channels[record.id] = record
                 elif rtype == "Message":
                     ch = channels.get(record.channel_id)
-                    if not ch or ch.topic != "/scoring/tf":
+                    if not ch or ch.topic not in SCORING_TF_TOPICS:
                         continue
                     sc = schemas.get(ch.schema_id)
                     if not sc:

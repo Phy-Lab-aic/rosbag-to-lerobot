@@ -1,0 +1,39 @@
+{
+  "task": "aic_e2e_test",
+  "repo_id": "aic_e2e_test",
+  "robot": "ur5e",
+  "fps": 20,
+  "folders": [
+    "run_20260421_005658_sfp_0000",
+    "run_20260421_010407_sfp_0020",
+    "run_20260421_010555_sfp_0021",
+    "run_20260421_010703_sfp_0022",
+    "run_20260421_010812_sfp_0023",
+    "run_20260421_010918_sfp_0024",
+    "run_20260421_011025_sfp_0025",
+    "run_20260421_011333_sfp_0026",
+    "run_20260421_011440_sfp_0027",
+    "run_20260421_011548_sfp_0028"
+  ],
+  "camera_topic_map": {
+    "cam_left": "/left_camera/image",
+    "cam_center": "/center_camera/image",
+    "cam_right": "/right_camera/image"
+  },
+  "joint_names": [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+    "gripper/left_finger_joint"
+  ],
+  "state_topic": "/joint_states",
+  "wrench_topic": "/fts_broadcaster/wrench",
+  "action_topics_map": {
+    "leader": "/joint_states"
+  },
+  "task_instruction": [],
+  "tags": []
+}

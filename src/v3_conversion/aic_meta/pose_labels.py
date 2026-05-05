@@ -15,6 +15,8 @@ from mcap_ros2.decoder import DecoderFactory
 
 logger = logging.getLogger(__name__)
 
+SCORING_TF_TOPICS = {"/scoring/tf", "/tf/scoring"}
+
 POSE_LABEL_KEYS = (
     "label.tcp_pose",
     "label.plug_pose_base",
@@ -363,7 +365,7 @@ def extract_pose_labels(
 
     for topic, t_ns, msg in _decoded_messages(
         Path(bag_path),
-        {"/aic_controller/controller_state", "/tf", "/scoring/tf"},
+        {"/aic_controller/controller_state", "/tf", *SCORING_TF_TOPICS},
     ):
         if topic == "/aic_controller/controller_state" and hasattr(msg, "tcp_pose"):
             try:
@@ -410,7 +412,7 @@ def extract_pose_labels(
                     break
             continue
 
-        if topic == "/scoring/tf":
+        if topic in SCORING_TF_TOPICS:
             for transform_stamped in transforms:
                 child = _child_frame_id(transform_stamped)
                 if not child:
