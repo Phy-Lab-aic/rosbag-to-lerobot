@@ -232,6 +232,7 @@ def build_mcap_fixture(tmp_path: Path):
         scoring_tf_topic="/scoring/tf",
         controller_state=None,
         tf=None,
+        tf_static=None,
         pose_commands=None,
     ) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -387,6 +388,33 @@ def build_mcap_fixture(tmp_path: Path):
                             }
                         )
                     queue_message(t_ns, 40, "/tf", tf_schema, {"transforms": tf_msgs})
+            if tf_static:
+                tf_schema = tf_schema or writer.register_msgdef(
+                    datatype="tf2_msgs/msg/TFMessage",
+                    msgdef_text=_build_tf_message_msgdef(),
+                )
+                for t_ns, transforms in tf_static:
+                    tf_msgs = []
+                    for parent, child, x, y, z, qx, qy, qz, qw in transforms:
+                        tf_msgs.append(
+                            {
+                                "header": {
+                                    "stamp": {
+                                        "sec": t_ns // 1_000_000_000,
+                                        "nanosec": t_ns % 1_000_000_000,
+                                    },
+                                    "frame_id": parent,
+                                },
+                                "child_frame_id": child,
+                                "transform": {
+                                    "translation": {"x": x, "y": y, "z": z},
+                                    "rotation": {"x": qx, "y": qy, "z": qz, "w": qw},
+                                },
+                            }
+                        )
+                    queue_message(
+                        t_ns, 40, "/tf_static", tf_schema, {"transforms": tf_msgs}
+                    )
             if pose_commands:
                 motion_schema = writer.register_msgdef(
                     datatype="aic_control_interfaces/msg/MotionUpdate",

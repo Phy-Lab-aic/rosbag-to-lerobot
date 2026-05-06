@@ -279,6 +279,10 @@ def _compose_poses(parent_to_mid: np.ndarray, mid_to_child: np.ndarray) -> np.nd
     return np.array([*translation, *rotation], dtype=np.float32)
 
 
+def _identity_pose() -> np.ndarray:
+    return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+
 def _compose_path_to_base(
     transforms_by_child: dict[str, tuple[str, np.ndarray]],
     base_frame: str,
@@ -288,7 +292,7 @@ def _compose_path_to_base(
     seen: set[str] = set()
     current = child_frame
     if current == base_frame:
-        return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        return _identity_pose()
 
     while current != base_frame:
         if current in seen:
@@ -307,20 +311,98 @@ def _compose_path_to_base(
     return composed
 
 
+def _invert_pose(pose: np.ndarray) -> np.ndarray:
+    translation = pose[:3].astype(np.float64)
+    rotation = _quat_normalized(pose[3:7].astype(np.float64))
+    inv_rotation = _quat_conjugate(rotation)
+    inv_translation = -_rotate_vector(inv_rotation, translation)
+    return np.array([*inv_translation, *inv_rotation], dtype=np.float32)
+
+
+def _resolve_pose_to_root(
+    transforms_by_child: dict[str, tuple[str, np.ndarray]],
+    child_frame: str,
+) -> tuple[str, np.ndarray | None]:
+    """Compose the pose of ``child_frame`` into its outermost ancestor.
+
+    Walks parent edges until a frame with no recorded parent is reached and
+    returns ``(root_frame, pose_in_root)``. Returns ``(child_frame, None)``
+    on cycles.
+    """
+    chain: list[np.ndarray] = []
+    seen: set[str] = {child_frame}
+    current = child_frame
+    while current in transforms_by_child:
+        parent, pose = transforms_by_child[current]
+        if parent in seen:
+            return child_frame, None
+        seen.add(parent)
+        chain.append(pose)
+        current = parent
+    if not chain:
+        return current, _identity_pose()
+    composed = chain.pop()
+    while chain:
+        composed = _compose_poses(composed, chain.pop())
+    return current, composed
+
+
+def _resolve_cross_tree_transform(
+    transforms_by_child: dict[str, tuple[str, np.ndarray]],
+    target_frame: str,
+    source_frame: str,
+) -> np.ndarray | None:
+    """Pose of ``source_frame`` expressed in ``target_frame``.
+
+    Resolves both frames by walking parent edges to a shared ancestor (e.g.
+    ``world`` connecting the robot ``/tf`` tree with the ``/scoring/tf``
+    ``aic_world`` tree). Returns ``None`` when no common ancestor is reachable
+    via child→parent traversal.
+    """
+    if target_frame == source_frame:
+        return _identity_pose()
+    target_ancestors = {target_frame}
+    current = target_frame
+    while current in transforms_by_child:
+        current = transforms_by_child[current][0]
+        if current in target_ancestors:
+            return None
+        target_ancestors.add(current)
+    current = source_frame
+    visited: set[str] = set()
+    common: str | None = None
+    while True:
+        if current in target_ancestors:
+            common = current
+            break
+        if current in visited or current not in transforms_by_child:
+            return None
+        visited.add(current)
+        current = transforms_by_child[current][0]
+    pose_common_target = _compose_path_to_base(
+        transforms_by_child, common, target_frame
+    )
+    pose_common_source = _compose_path_to_base(
+        transforms_by_child, common, source_frame
+    )
+    if pose_common_target is None or pose_common_source is None:
+        return None
+    return _compose_poses(_invert_pose(pose_common_target), pose_common_source)
+
+
 def _append_first_resolved_scoring_sample(
-    scoring_samples: dict[str, list[tuple[int, np.ndarray]]],
+    scoring_samples: dict[str, list[tuple[int, str, np.ndarray]]],
     transforms_by_child: dict[str, tuple[str, np.ndarray]],
     label_key: str,
     candidates: Iterable[str],
     t_ns: int,
-    base_frame: str,
 ) -> None:
     for child_frame in candidates:
         if child_frame not in transforms_by_child:
             continue
-        pose = _compose_path_to_base(transforms_by_child, base_frame, child_frame)
+        root, pose = _resolve_pose_to_root(transforms_by_child, child_frame)
         if pose is not None:
-            scoring_samples[label_key].append((t_ns, pose))
+            scoring_samples[label_key].append((t_ns, root, pose))
             return
 
 
@@ -337,7 +419,7 @@ def extract_pose_labels(
 
     tcp_samples: list[tuple[int, np.ndarray]] = []
     tf_tcp_samples: list[tuple[int, np.ndarray]] = []
-    scoring_samples: dict[str, list[tuple[int, np.ndarray]]] = {
+    raw_scoring_samples: dict[str, list[tuple[int, str, np.ndarray]]] = {
         "label.plug_pose_base": [],
         "label.port_pose_base": [],
         "label.target_module_pose_base": [],
@@ -365,7 +447,12 @@ def extract_pose_labels(
 
     for topic, t_ns, msg in _decoded_messages(
         Path(bag_path),
-        {"/aic_controller/controller_state", "/tf", *SCORING_TF_TOPICS},
+        {
+            "/aic_controller/controller_state",
+            "/tf",
+            "/tf_static",
+            *SCORING_TF_TOPICS,
+        },
     ):
         if topic == "/aic_controller/controller_state" and hasattr(msg, "tcp_pose"):
             try:
@@ -381,7 +468,7 @@ def extract_pose_labels(
             continue
 
         transforms = getattr(msg, "transforms", [])
-        if topic == "/tf":
+        if topic in ("/tf", "/tf_static"):
             for transform_stamped in transforms:
                 child = _child_frame_id(transform_stamped)
                 if not child:
@@ -401,15 +488,16 @@ def extract_pose_labels(
                         traceback.format_exc(limit=1).strip(),
                     )
                     continue
-            for child_frame in _TCP_FRAME_CANDIDATES:
-                pose = _compose_path_to_base(
-                    tf_transforms,
-                    normalized_base_frame,
-                    child_frame,
-                )
-                if pose is not None:
-                    tf_tcp_samples.append((t_ns, pose))
-                    break
+            if topic == "/tf":
+                for child_frame in _TCP_FRAME_CANDIDATES:
+                    pose = _compose_path_to_base(
+                        tf_transforms,
+                        normalized_base_frame,
+                        child_frame,
+                    )
+                    if pose is not None:
+                        tf_tcp_samples.append((t_ns, pose))
+                        break
             continue
 
         if topic in SCORING_TF_TOPICS:
@@ -433,28 +521,25 @@ def extract_pose_labels(
                     )
 
             _append_first_resolved_scoring_sample(
-                scoring_samples,
+                raw_scoring_samples,
                 scoring_transforms,
                 "label.plug_pose_base",
                 plug_candidates,
                 t_ns,
-                normalized_base_frame,
             )
             _append_first_resolved_scoring_sample(
-                scoring_samples,
+                raw_scoring_samples,
                 scoring_transforms,
                 "label.port_pose_base",
                 port_candidates,
                 t_ns,
-                normalized_base_frame,
             )
             _append_first_resolved_scoring_sample(
-                scoring_samples,
+                raw_scoring_samples,
                 scoring_transforms,
                 "label.target_module_pose_base",
                 target_candidates,
                 t_ns,
-                normalized_base_frame,
             )
 
     tcp_source = tcp_samples if tcp_samples else tf_tcp_samples
@@ -463,6 +548,10 @@ def extract_pose_labels(
         result["label.tcp_pose_valid"],
         tcp_source,
         frame_times,
+    )
+
+    scoring_samples = _rebase_scoring_samples(
+        raw_scoring_samples, tf_transforms, normalized_base_frame
     )
     for key, samples in scoring_samples.items():
         _fill_from_samples(
@@ -473,3 +562,43 @@ def extract_pose_labels(
         )
 
     return result
+
+
+def _rebase_scoring_samples(
+    raw_scoring_samples: dict[str, list[tuple[int, str, np.ndarray]]],
+    tf_transforms: dict[str, tuple[str, np.ndarray]],
+    base_frame: str,
+) -> dict[str, list[tuple[int, np.ndarray]]]:
+    """Convert per-sample (root, pose_in_root) tuples into ``base_frame`` poses.
+
+    Scoring TF rooted at ``aic_world`` is bridged to the robot ``base_link``
+    tree via static transforms (typically ``world``). Samples whose root
+    cannot be resolved to ``base_frame`` are dropped so ``_fill_from_samples``
+    leaves the corresponding entries invalid.
+    """
+    rebased: dict[str, list[tuple[int, np.ndarray]]] = {
+        key: [] for key in raw_scoring_samples
+    }
+    required_roots = {
+        root
+        for samples in raw_scoring_samples.values()
+        for _, root, _ in samples
+    }
+    root_to_base: dict[str, np.ndarray | None] = {}
+    for root in required_roots:
+        transform = _resolve_cross_tree_transform(tf_transforms, base_frame, root)
+        if transform is None:
+            logger.warning(
+                "Unable to resolve transform from %s to scoring root %s; "
+                "dropping pose-label samples expressed in that root.",
+                base_frame,
+                root,
+            )
+        root_to_base[root] = transform
+    for key, samples in raw_scoring_samples.items():
+        for t_ns, root, pose_in_root in samples:
+            transform = root_to_base.get(root)
+            if transform is None:
+                continue
+            rebased[key].append((t_ns, _compose_poses(transform, pose_in_root)))
+    return rebased

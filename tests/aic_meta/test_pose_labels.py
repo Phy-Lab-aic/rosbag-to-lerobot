@@ -409,6 +409,132 @@ def test_extract_pose_labels_uses_ordered_candidate_preference(
     )
 
 
+def test_extract_pose_labels_bridges_aic_world_to_base_via_tf_static(
+    build_mcap_fixture, tmp_path: Path
+):
+    bag = build_mcap_fixture(
+        path=tmp_path / "scoring_cross_tree.mcap",
+        tf_static=[
+            (
+                10_000_000,
+                [
+                    ("world", "aic_world", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+                    ("world", "tabletop", 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+                    ("tabletop", "base_link", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+                ],
+            )
+        ],
+        scoring_tf=[
+            (
+                50_000_000,
+                [
+                    (
+                        "aic_world",
+                        "task_board",
+                        2.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ),
+                    (
+                        "task_board",
+                        "task_board/nic_card_mount_0",
+                        0.0,
+                        3.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ),
+                    (
+                        "task_board/nic_card_mount_0",
+                        "task_board/nic_card_mount_0/sfp_port_0_link",
+                        0.0,
+                        0.0,
+                        0.5,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ),
+                ],
+            )
+        ],
+    )
+
+    labels = extract_pose_labels(
+        bag_path=bag,
+        frame_timestamps_ns=[50_000_000],
+        episode_meta={
+            "cable_name": "cable_0",
+            "plug_name": "sfp_tip",
+            "port_name": "sfp_port_0",
+            "target_module": "nic_card_mount_0",
+        },
+        base_frame="base_link",
+    )
+
+    # task_board origin in aic_world is (2,0,0); base_link in world is (0.5,0,0)
+    # so task_board in base_link should be (2-0.5, 0, 0) = (1.5, 0, 0).
+    assert labels["label.target_module_pose_base_valid"].tolist() == [True]
+    assert np.allclose(
+        labels["label.target_module_pose_base"][0],
+        [1.5, 3.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    )
+    # sfp_port_0_link sits at task_board/nic_card_mount_0 + (0,0,0.5).
+    assert labels["label.port_pose_base_valid"].tolist() == [True]
+    assert np.allclose(
+        labels["label.port_pose_base"][0],
+        [1.5, 3.0, 0.5, 0.0, 0.0, 0.0, 1.0],
+    )
+
+
+def test_extract_pose_labels_drops_scoring_when_base_unreachable(
+    build_mcap_fixture, tmp_path: Path
+):
+    bag = build_mcap_fixture(
+        path=tmp_path / "scoring_unbridged.mcap",
+        scoring_tf=[
+            (
+                50_000_000,
+                [
+                    ("aic_world", "task_board", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+                    (
+                        "task_board",
+                        "task_board/nic_card_mount_0",
+                        0.0,
+                        2.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ),
+                ],
+            )
+        ],
+    )
+
+    labels = extract_pose_labels(
+        bag_path=bag,
+        frame_timestamps_ns=[50_000_000],
+        episode_meta={
+            "cable_name": "cable_0",
+            "plug_name": "sfp_tip",
+            "port_name": "sfp_port_0",
+            "target_module": "nic_card_mount_0",
+        },
+        base_frame="base_link",
+    )
+
+    assert labels["label.target_module_pose_base_valid"].tolist() == [False]
+    assert math.isnan(float(labels["label.target_module_pose_base"][0][0]))
+
+
 def test_decoded_messages_warns_when_decoder_construction_fails(
     tmp_path: Path, monkeypatch, caplog
 ):
