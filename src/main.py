@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import cv2
+import numpy as np
 import pyarrow.parquet as pq
 
 from v3_conversion.action_shift import apply_one_step_shift
@@ -286,6 +288,109 @@ def _prepare_config(
     return mcap_path, config
 
 
+def _image_dir_for_camera(camera_name: str) -> str:
+    lowered = camera_name.lower()
+    if "left" in lowered:
+        return "left"
+    if "center" in lowered:
+        return "center"
+    if "right" in lowered:
+        return "right"
+    return camera_name
+
+
+def _can_use_recorded_episode(
+    missing_topics: list[str],
+    config,
+    episode_dir: Path,
+) -> bool:
+    camera_topics = set(config.topic_map.keys())
+    if not missing_topics or not set(missing_topics).issubset(camera_topics):
+        return False
+    required = ("states.npy", "timestamps.npy")
+    if any(not (episode_dir / name).is_file() for name in required):
+        return False
+    image_root = episode_dir / "images"
+    return all(
+        any((image_root / _image_dir_for_camera(cam)).glob("*.png"))
+        for cam in config.camera_names
+    )
+
+
+def _load_recorded_episode(
+    *,
+    episode_dir: Path,
+    config,
+    task_instruction: str,
+) -> tuple[dict[str, Any], list[int], dict[str, list[int]]]:
+    states = np.load(episode_dir / "states.npy").astype(np.float32)
+    if states.ndim != 2 or states.shape[0] < 2:
+        raise ValueError(f"states.npy must be a 2D array with at least 2 frames: {states.shape}")
+
+    obs_dim = len(config.joint_order.get("obs", []))
+    if obs_dim <= 0 or states.shape[1] < obs_dim:
+        raise ValueError(
+            f"states.npy shape {states.shape} cannot provide {obs_dim} observation joints"
+        )
+    obs = states[:, -obs_dim:]
+
+    timestamps_sec = np.load(episode_dir / "timestamps.npy")
+    if len(timestamps_sec) != len(obs):
+        raise ValueError(
+            f"timestamps.npy has {len(timestamps_sec)} frames, expected {len(obs)}"
+        )
+    frame_timestamps_ns = [int(float(ts) * 1_000_000_000) for ts in timestamps_sec]
+
+    image_root = episode_dir / "images"
+    images: dict[str, list[np.ndarray]] = {}
+    for camera_name in config.camera_names:
+        image_dir = image_root / _image_dir_for_camera(camera_name)
+        frames: list[np.ndarray] = []
+        for image_path in sorted(image_dir.glob("*.png")):
+            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f"failed to read image: {image_path}")
+            frames.append(image)
+        if len(frames) != len(obs):
+            raise ValueError(
+                f"{image_dir} has {len(frames)} images, expected {len(obs)}"
+            )
+        images[camera_name] = frames
+
+    episode: dict[str, Any] = {
+        "obs": obs,
+        "images": images,
+        "task": task_instruction,
+    }
+
+    action_cfg = config.joint_order.get("action", {})
+    for action_name in config.action_order:
+        width = len(action_cfg.get(action_name, []))
+        if width <= 0:
+            continue
+        if width != obs_dim:
+            raise ValueError(
+                f"recorded episode fallback requires action width {width} to match obs width {obs_dim}"
+            )
+        episode[action_name] = obs.copy()
+
+    optional_arrays = {
+        "velocity": "joint_velocities.npy",
+        "wrench": "wrenches.npy",
+    }
+    for key, filename in optional_arrays.items():
+        path = episode_dir / filename
+        if not path.is_file():
+            continue
+        arr = np.load(path).astype(np.float32)
+        if len(arr) != len(obs):
+            raise ValueError(f"{filename} has {len(arr)} frames, expected {len(obs)}")
+        episode[key] = arr
+
+    timestamps = {topic: frame_timestamps_ns for topic in config.topic_map.values()}
+    return episode, frame_timestamps_ns, timestamps
+
+
 # ------------------------------------------------------------------
 # Main conversion
 # ------------------------------------------------------------------
@@ -433,7 +538,12 @@ def run_conversion(
 
             # 3. Pre-check: all expected topics exist in MCAP
             validation = validate_mcap_topics(str(mcap_path), config.topic_map)
-            if validation["missing_topics"]:
+            use_recorded_episode = _can_use_recorded_episode(
+                validation["missing_topics"],
+                config,
+                episode_context.episode_dir,
+            )
+            if validation["missing_topics"] and not use_recorded_episode:
                 skipped_count += 1
                 reason = (
                     "missing required MCAP topics: "
@@ -455,26 +565,47 @@ def run_conversion(
                     fps=config.fps,
                 )
 
-            # 5. Extract frames
-            frames, timestamps = extract_frames(
-                bag_path=str(mcap_path), config=config,
-            )
+            episode_meta = load_episode_metadata(episode_context.episode_dir)
+            task_instruction = build_task_string(episode_meta)
 
-            # 6. Hz validation
-            logger.info("  [Hz] validating %s (target=%dHz)", folder_name, config.fps)
-            hz_result = validate_from_timestamps(
-                timestamps=timestamps,
-                target_hz=float(config.fps),
-                min_ratio=config.hz_min_ratio,
-                camera_names=config.camera_names,
-            )
-            if not hz_result.is_valid:
-                raise ValueError(
-                    f"[folder={folder_name}] {hz_result.overall_message}"
+            # 5. Extract frames, or reuse collector-recorded episode artifacts
+            # when the MCAP intentionally excludes camera image topics.
+            if use_recorded_episode:
+                logger.info(
+                    "  Using recorded episode artifacts because MCAP is missing camera topics: %s",
+                    validation["missing_topics"],
                 )
-            logger.info("  [Hz] PASSED: %s", folder_name)
+                episode, frame_timestamps_ns, timestamps = _load_recorded_episode(
+                    episode_dir=episode_context.episode_dir,
+                    config=config,
+                    task_instruction=task_instruction,
+                )
+                frames = []
+            else:
+                frames, timestamps = extract_frames(
+                    bag_path=str(mcap_path), config=config,
+                )
 
-            if not frames:
+            # 6. Hz validation. Recorded episode artifacts may be emitted at the
+            # collector's effective sampling rate rather than the converter
+            # config FPS, and were already validated by the collector.
+            if use_recorded_episode:
+                logger.info("  [Hz] skipped for recorded episode artifacts: %s", folder_name)
+            else:
+                logger.info("  [Hz] validating %s (target=%dHz)", folder_name, config.fps)
+                hz_result = validate_from_timestamps(
+                    timestamps=timestamps,
+                    target_hz=float(config.fps),
+                    min_ratio=config.hz_min_ratio,
+                    camera_names=config.camera_names,
+                )
+                if not hz_result.is_valid:
+                    raise ValueError(
+                        f"[folder={folder_name}] {hz_result.overall_message}"
+                    )
+                logger.info("  [Hz] PASSED: %s", folder_name)
+
+            if not use_recorded_episode and not frames:
                 raise ValueError(
                     f"No frames extracted [folder={folder_name}] from {mcap_path}. "
                     f"All expected topics present but build_frame() returned None "
@@ -482,14 +613,12 @@ def run_conversion(
                     f"(missing leader topics or action key mismatch)."
                 )
 
-            frame_timestamps_ns = [
-                int(frame["emitted_timestamp_ns"]) for frame in frames
-            ]
+            if not use_recorded_episode:
+                frame_timestamps_ns = [
+                    int(frame["emitted_timestamp_ns"]) for frame in frames
+                ]
 
             # 7. Transform to episode with task derived from episode metadata
-            episode_meta = load_episode_metadata(episode_context.episode_dir)
-            task_instruction = build_task_string(episode_meta)
-
             trial_dir = episode_context.trial_dir or run_dir
             trial_key = episode_context.trial_key
             run_meta = load_run_meta(run_dir)
@@ -551,14 +680,15 @@ def run_conversion(
             }
             del timestamps
 
-            # frames_to_episode consumes and clears the frames list
-            episode = frames_to_episode(
-                frames=frames,
-                action_order=config.action_order,
-                camera_names=config.camera_names,
-                task=task_instruction,
-            )
-            del frames
+            if not use_recorded_episode:
+                # frames_to_episode consumes and clears the frames list
+                episode = frames_to_episode(
+                    frames=frames,
+                    action_order=config.action_order,
+                    camera_names=config.camera_names,
+                    task=task_instruction,
+                )
+                del frames
             episode.update(pose_labels)
             episode = apply_one_step_shift(episode)
 
