@@ -317,12 +317,24 @@ def _can_use_recorded_episode(
     )
 
 
+def _infer_recorded_episode_fps(
+    timestamps_sec: np.ndarray,
+    fallback_fps: int,
+) -> int:
+    if len(timestamps_sec) < 2:
+        return fallback_fps
+    duration_sec = float(timestamps_sec[-1] - timestamps_sec[0])
+    if duration_sec <= 0:
+        return fallback_fps
+    return max(1, int(round((len(timestamps_sec) - 1) / duration_sec)))
+
+
 def _load_recorded_episode(
     *,
     episode_dir: Path,
     config,
     task_instruction: str,
-) -> tuple[dict[str, Any], list[int], dict[str, list[int]]]:
+) -> tuple[dict[str, Any], list[int], dict[str, list[int]], int]:
     states = np.load(episode_dir / "states.npy").astype(np.float32)
     if states.ndim != 2 or states.shape[0] < 2:
         raise ValueError(f"states.npy must be a 2D array with at least 2 frames: {states.shape}")
@@ -339,6 +351,7 @@ def _load_recorded_episode(
         raise ValueError(
             f"timestamps.npy has {len(timestamps_sec)} frames, expected {len(obs)}"
         )
+    recorded_fps = _infer_recorded_episode_fps(timestamps_sec, config.fps)
     frame_timestamps_ns = [int(float(ts) * 1_000_000_000) for ts in timestamps_sec]
 
     image_root = episode_dir / "images"
@@ -388,7 +401,7 @@ def _load_recorded_episode(
         episode[key] = arr
 
     timestamps = {topic: frame_timestamps_ns for topic in config.topic_map.values()}
-    return episode, frame_timestamps_ns, timestamps
+    return episode, frame_timestamps_ns, timestamps, recorded_fps
 
 
 # ------------------------------------------------------------------
@@ -553,20 +566,9 @@ def run_conversion(
                 logger.info("  Skipped %s: %s", folder_name, reason)
                 continue
 
-            # 4. Initialize DataCreator on first run that will extract frames
-            if creator is None:
-                creator = DataCreator(
-                    repo_id=repo_id,
-                    root=output_root,
-                    robot_type=config.robot_type,
-                    action_order=config.action_order,
-                    joint_order=config.joint_order,
-                    camera_names=config.camera_names,
-                    fps=config.fps,
-                )
-
             episode_meta = load_episode_metadata(episode_context.episode_dir)
             task_instruction = build_task_string(episode_meta)
+            effective_fps = config.fps
 
             # 5. Extract frames, or reuse collector-recorded episode artifacts
             # when the MCAP intentionally excludes camera image topics.
@@ -575,18 +577,42 @@ def run_conversion(
                     "  Using recorded episode artifacts because MCAP is missing camera topics: %s",
                     validation["missing_topics"],
                 )
-                episode, frame_timestamps_ns, timestamps = _load_recorded_episode(
+                episode, frame_timestamps_ns, timestamps, effective_fps = _load_recorded_episode(
                     episode_dir=episode_context.episode_dir,
                     config=config,
                     task_instruction=task_instruction,
                 )
+                if effective_fps != config.fps:
+                    logger.warning(
+                        "  Recorded episode effective fps=%d differs from config fps=%d; "
+                        "using effective fps to preserve camera duration.",
+                        effective_fps,
+                        config.fps,
+                    )
                 frames = []
             else:
                 frames, timestamps = extract_frames(
                     bag_path=str(mcap_path), config=config,
                 )
 
-            # 6. Hz validation. Recorded episode artifacts may be emitted at the
+            # 6. Initialize DataCreator once the effective FPS is known.
+            if creator is None:
+                creator = DataCreator(
+                    repo_id=repo_id,
+                    root=output_root,
+                    robot_type=config.robot_type,
+                    action_order=config.action_order,
+                    joint_order=config.joint_order,
+                    camera_names=config.camera_names,
+                    fps=effective_fps,
+                )
+            elif creator.fps != effective_fps:
+                raise ValueError(
+                    f"folder {folder_name} has effective fps {effective_fps}, "
+                    f"but dataset was initialized with fps {creator.fps}"
+                )
+
+            # 7. Hz validation. Recorded episode artifacts may be emitted at the
             # collector's effective sampling rate rather than the converter
             # config FPS, and were already validated by the collector.
             if use_recorded_episode:
@@ -618,7 +644,7 @@ def run_conversion(
                     int(frame["emitted_timestamp_ns"]) for frame in frames
                 ]
 
-            # 7. Transform to episode with task derived from episode metadata
+            # 8. Transform to episode with task derived from episode metadata
             trial_dir = episode_context.trial_dir or run_dir
             trial_key = episode_context.trial_key
             run_meta = load_run_meta(run_dir)
@@ -692,7 +718,7 @@ def run_conversion(
             episode.update(pose_labels)
             episode = apply_one_step_shift(episode)
 
-            # 8. Convert episode
+            # 9. Convert episode
             creator.convert_episode(episode)
             del episode
             aic_task_rows.append(task_row)

@@ -5,6 +5,8 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import cv2
+import numpy as np
 import pytest
 import pyarrow.parquet as pq
 
@@ -1035,3 +1037,35 @@ def test_load_config_and_metacard_propagate_wrench_topic(monkeypatch, tmp_path):
 
     assert cfg["wrench_topic"] == "/fts_broadcaster/wrench"
     assert metacard["wrench_topic"] == "/fts_broadcaster/wrench"
+
+
+def test_load_recorded_episode_infers_effective_fps_from_timestamps(
+    monkeypatch, tmp_path
+):
+    main, _ = _import_main(monkeypatch)
+    episode_dir = tmp_path / "episode"
+    image_dir = episode_dir / "images" / "left"
+    image_dir.mkdir(parents=True)
+
+    frame_count = 57
+    np.save(
+        episode_dir / "states.npy",
+        np.arange(frame_count, dtype=np.float32).reshape(frame_count, 1),
+    )
+    np.save(episode_dir / "timestamps.npy", np.linspace(100.0, 105.0, frame_count))
+    for idx in range(frame_count):
+        assert cv2.imwrite(
+            str(image_dir / f"{idx:06d}.png"),
+            np.zeros((2, 2, 3), dtype=np.uint8),
+        )
+
+    episode, frame_timestamps_ns, timestamps, fps = main._load_recorded_episode(
+        episode_dir=episode_dir,
+        config=_fake_bag_config(),
+        task_instruction="task",
+    )
+
+    assert fps == 11
+    assert len(episode["images"]["cam_left"]) == frame_count
+    assert frame_timestamps_ns[0] == 100_000_000_000
+    assert timestamps["cam_left"][-1] == 105_000_000_000
