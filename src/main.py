@@ -14,7 +14,7 @@ import json
 import logging
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -299,6 +299,40 @@ def _image_dir_for_camera(camera_name: str) -> str:
     return camera_name
 
 
+def _remap_missing_cameras_to_compressed(
+    config,
+    mcap_topics: list[str],
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """Compute a topic_map override that swaps missing raw camera topics for
+    their CompressedImage variants.
+
+    When a bag was recorded with image_transport's compressed-only output,
+    raw `/cam/image` is absent but `/cam/image/compressed` exists. This
+    helper is pure: it does not touch `config`. The caller should rebuild
+    the Rosbag (e.g. dataclasses.replace) with the returned topic_map when
+    any remappings are reported.
+    """
+    available = set(mcap_topics)
+    camera_canonicals = set(config.camera_names)
+    new_topic_map = dict(config.topic_map)
+    remapped: list[tuple[str, str]] = []
+
+    for raw_topic in list(new_topic_map.keys()):
+        canonical = new_topic_map[raw_topic]
+        if canonical not in camera_canonicals:
+            continue
+        if raw_topic in available:
+            continue
+        compressed_topic = f"{raw_topic}/compressed"
+        if compressed_topic not in available:
+            continue
+        del new_topic_map[raw_topic]
+        new_topic_map[compressed_topic] = canonical
+        remapped.append((raw_topic, compressed_topic))
+
+    return new_topic_map, remapped
+
+
 def _can_use_recorded_episode(
     missing_topics: list[str],
     config,
@@ -551,6 +585,18 @@ def run_conversion(
 
             # 3. Pre-check: all expected topics exist in MCAP
             validation = validate_mcap_topics(str(mcap_path), config.topic_map)
+            new_topic_map, remapped_cameras = _remap_missing_cameras_to_compressed(
+                config, validation.get("mcap_topics", [])
+            )
+            if remapped_cameras:
+                for raw_t, comp_t in remapped_cameras:
+                    logger.info(
+                        "  Remapped missing camera topic %s -> %s "
+                        "(CompressedImage fallback)",
+                        raw_t, comp_t,
+                    )
+                config = dataclass_replace(config, topic_map=new_topic_map)
+                validation = validate_mcap_topics(str(mcap_path), config.topic_map)
             use_recorded_episode = _can_use_recorded_episode(
                 validation["missing_topics"],
                 config,

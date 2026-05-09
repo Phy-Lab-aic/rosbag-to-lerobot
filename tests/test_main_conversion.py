@@ -1069,3 +1069,98 @@ def test_load_recorded_episode_infers_effective_fps_from_timestamps(
     assert len(episode["images"]["cam_left"]) == frame_count
     assert frame_timestamps_ns[0] == 100_000_000_000
     assert timestamps["cam_left"][-1] == 105_000_000_000
+
+
+def test_remap_missing_cameras_to_compressed_returns_new_topic_map(monkeypatch):
+    main, _ = _import_main(monkeypatch)
+    original_topic_map = {
+        "/left_camera/image": "cam_left",
+        "/center_camera/image": "cam_center",
+        "/joint_states": "observation",
+    }
+    config = SimpleNamespace(
+        camera_names=["cam_left", "cam_center"],
+        topic_map=original_topic_map,
+    )
+    mcap_topics = [
+        "/left_camera/image/compressed",
+        "/center_camera/image/compressed",
+        "/joint_states",
+    ]
+
+    new_topic_map, remapped = main._remap_missing_cameras_to_compressed(
+        config, mcap_topics
+    )
+
+    assert sorted(remapped) == [
+        ("/center_camera/image", "/center_camera/image/compressed"),
+        ("/left_camera/image", "/left_camera/image/compressed"),
+    ]
+    assert new_topic_map == {
+        "/left_camera/image/compressed": "cam_left",
+        "/center_camera/image/compressed": "cam_center",
+        "/joint_states": "observation",
+    }
+    # Pure: input topic_map must be untouched.
+    assert config.topic_map is original_topic_map
+    assert original_topic_map == {
+        "/left_camera/image": "cam_left",
+        "/center_camera/image": "cam_center",
+        "/joint_states": "observation",
+    }
+
+
+def test_remap_missing_cameras_skips_when_raw_topic_already_present(monkeypatch):
+    main, _ = _import_main(monkeypatch)
+    original_topic_map = {
+        "/left_camera/image": "cam_left",
+        "/joint_states": "observation",
+    }
+    config = SimpleNamespace(
+        camera_names=["cam_left"],
+        topic_map=original_topic_map,
+    )
+    mcap_topics = [
+        "/left_camera/image",
+        "/left_camera/image/compressed",
+        "/joint_states",
+    ]
+
+    new_topic_map, remapped = main._remap_missing_cameras_to_compressed(
+        config, mcap_topics
+    )
+
+    assert remapped == []
+    assert new_topic_map == original_topic_map
+    assert new_topic_map is not original_topic_map  # always returns a copy
+
+
+def test_remap_missing_cameras_leaves_non_camera_topics_untouched(monkeypatch):
+    main, _ = _import_main(monkeypatch)
+    original_topic_map = {
+        "/left_camera/image": "cam_left",
+        "/joint_states": "observation",
+        "/fts_broadcaster/wrench": "wrench",
+    }
+    config = SimpleNamespace(
+        camera_names=["cam_left"],
+        topic_map=original_topic_map,
+    )
+    mcap_topics = ["/left_camera/image/compressed"]
+
+    new_topic_map, remapped = main._remap_missing_cameras_to_compressed(
+        config, mcap_topics
+    )
+
+    assert remapped == [("/left_camera/image", "/left_camera/image/compressed")]
+    assert new_topic_map == {
+        "/left_camera/image/compressed": "cam_left",
+        "/joint_states": "observation",
+        "/fts_broadcaster/wrench": "wrench",
+    }
+    # Pure: even non-camera topics in original_topic_map must be intact.
+    assert original_topic_map == {
+        "/left_camera/image": "cam_left",
+        "/joint_states": "observation",
+        "/fts_broadcaster/wrench": "wrench",
+    }
