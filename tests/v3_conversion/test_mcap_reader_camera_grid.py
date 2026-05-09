@@ -233,6 +233,45 @@ def test_extract_frames_downsamples_primary_camera_to_config_fps(build_mcap_fixt
     assert [round(float(frame["obs"][0]), 3) for frame in frames] == [0.0, 0.05, 0.1]
 
 
+def test_extract_frames_keeps_near_target_fps_with_jitter(build_mcap_fixture, tmp_path):
+    cam_times = [0, 47_000_000, 100_000_000, 147_000_000, 200_000_000]
+    bag = build_mcap_fixture(
+        path=tmp_path / "near_target_jitter.mcap",
+        joint_states=[(i * 1_000_000, JOINTS, [i * 0.001] * 7) for i in range(240)],
+        wrench=[(i * 10_000_000, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6) for i in range(30)],
+        images=_mk_sync_images(
+            {
+                "/left_camera/image": cam_times,
+                "/center_camera/image": cam_times,
+                "/right_camera/image": cam_times,
+            }
+        ),
+    )
+    config = Rosbag(
+        topic_map={
+            "/left_camera/image": "cam_left",
+            "/center_camera/image": "cam_center",
+            "/right_camera/image": "cam_right",
+            "/joint_states": "observation",
+            "/fts_broadcaster/wrench": "wrench",
+        },
+        action_order=["action"],
+        joint_order={"obs": JOINTS, "action": {"action": JOINTS}},
+        camera_names=["cam_left", "cam_center", "cam_right"],
+        fps=20,
+        shared_action_names=["action"],
+        wrench_topic="/fts_broadcaster/wrench",
+    )
+
+    frames, _ = extract_frames(bag_path=str(bag), config=config)
+
+    assert [frame["emitted_timestamp_ns"] for frame in frames] == cam_times
+    assert (len(frames) - 1) / (
+        (frames[-1]["emitted_timestamp_ns"] - frames[0]["emitted_timestamp_ns"])
+        / 1_000_000_000
+    ) == 20.0
+
+
 def test_extract_frames_emits_when_non_primary_camera_closes_tick(
     build_mcap_fixture, tmp_path
 ):
