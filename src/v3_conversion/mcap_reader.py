@@ -15,6 +15,7 @@ from v3_conversion.data_spec import Rosbag
 from v3_conversion.data_converter import build_frame
 
 HZ_MIN_RATIO = 0.7
+CAMERA_THROTTLE_EARLY_TOLERANCE_RATIO = 0.10
 
 
 # ------------------------------------------------------------------
@@ -200,6 +201,11 @@ def extract_frames(
 
     primary_cam_name = camera_names[0] if camera_names else None
     timegap = 1_000_000_000 // fps if fps > 0 else 0
+    min_emit_gap_ns = (
+        timegap - int(timegap * CAMERA_THROTTLE_EARLY_TOLERANCE_RATIO)
+        if timegap
+        else 0
+    )
     camera_sync_tolerance_ns = timegap // 2 if timegap else 0
 
     latest_joint_msg = None
@@ -251,7 +257,7 @@ def extract_frames(
         if last_emitted_tick_ns == primary_tick_ns:
             continue
         if timegap and last_emitted_tick_ns is not None:
-            if (primary_tick_ns - last_emitted_tick_ns) < timegap:
+            if (primary_tick_ns - last_emitted_tick_ns) < min_emit_gap_ns:
                 continue
         if latest_joint_msg is None:
             continue
