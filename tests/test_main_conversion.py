@@ -27,7 +27,19 @@ def _import_main(monkeypatch):
     class _PlaceholderDataCreator:
         pass
 
+    def _placeholder_compute_schema_version(features):
+        has_velocity = "observation.velocity" in features
+        has_wrench = "observation.wrench" in features
+        if has_velocity and has_wrench:
+            return "0.3.0"
+        if has_velocity:
+            return "0.2.0"
+        if has_wrench:
+            return "0.1.0"
+        return "0.0.0"
+
     data_creator_mod.DataCreator = _PlaceholderDataCreator
+    data_creator_mod.compute_schema_version = _placeholder_compute_schema_version
     monkeypatch.setitem(sys.modules, "v3_conversion.data_creator", data_creator_mod)
 
     lerobot_pkg = types.ModuleType("lerobot")
@@ -329,6 +341,7 @@ def test_run_conversion_does_not_persist_episode_when_aic_meta_extraction_fails(
             self.dataset = SimpleNamespace(
                 meta=SimpleNamespace(total_episodes=1),
                 finalize=lambda: None,
+                features={},
             )
 
         def recover_dataset_state(self):
@@ -440,6 +453,7 @@ def test_run_conversion_uses_first_emitted_frame_timestamp_for_insertion_event(
     class FakeDataset:
         def __init__(self):
             self.meta = SimpleNamespace(total_episodes=0)
+            self.features = {}
 
         def finalize(self):
             return None
@@ -571,6 +585,7 @@ def test_run_conversion_prefers_trial_episode_metadata_over_root_metadata(
     class FakeDataset:
         def __init__(self):
             self.meta = SimpleNamespace(total_episodes=0)
+            self.features = {}
 
         def finalize(self):
             return None
@@ -715,6 +730,7 @@ def test_run_conversion_skips_push_to_hub_when_finalize_metadata_write_fails(
     class FakeDataset:
         def __init__(self):
             self.meta = SimpleNamespace(total_episodes=0)
+            self.features = {}
 
         def finalize(self):
             return None
@@ -881,6 +897,7 @@ def test_run_conversion_merge_mode_preserves_existing_aic_rows(
     class FakeDataset:
         def __init__(self, total_episodes=1):
             self.meta = SimpleNamespace(total_episodes=total_episodes)
+            self.features = {}
 
         def finalize(self):
             return None
@@ -1037,6 +1054,14 @@ def test_load_config_and_metacard_propagate_wrench_topic(monkeypatch, tmp_path):
 
     assert cfg["wrench_topic"] == "/fts_broadcaster/wrench"
     assert metacard["wrench_topic"] == "/fts_broadcaster/wrench"
+
+
+def test_default_config_includes_wrench_topic():
+    config_path = (
+        Path(__file__).resolve().parents[1] / "src" / "config.json"
+    )
+    config = json.loads(config_path.read_text())
+    assert config.get("wrench_topic") == "/fts_broadcaster/wrench"
 
 
 def test_load_recorded_episode_infers_effective_fps_from_timestamps(
