@@ -23,9 +23,22 @@ JOINTS = [
 class _FakeDataset:
     def __init__(self):
         self.meta = SimpleNamespace(total_episodes=0)
+        self.features = {}
 
     def finalize(self):
         return None
+
+
+def _placeholder_compute_schema_version(features):
+    has_velocity = "observation.velocity" in features
+    has_wrench = "observation.wrench" in features
+    if has_velocity and has_wrench:
+        return "0.3.0"
+    if has_velocity:
+        return "0.2.0"
+    if has_wrench:
+        return "0.1.0"
+    return "0.0.0"
 
 
 class _FakeDataCreator:
@@ -56,6 +69,7 @@ def _import_main(monkeypatch):
     sys.modules.pop("main", None)
     data_creator_mod = types.ModuleType("v3_conversion.data_creator")
     data_creator_mod.DataCreator = _FakeDataCreator
+    data_creator_mod.compute_schema_version = _placeholder_compute_schema_version
     monkeypatch.setitem(sys.modules, "v3_conversion.data_creator", data_creator_mod)
     module = importlib.import_module("main")
     return importlib.reload(module)

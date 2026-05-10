@@ -20,6 +20,45 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 logger = logging.getLogger(__name__)
 
 
+# Map the set of optional observation features to a stable dataset schema_version.
+# The label is sourced from the actual feature key set so that two datasets
+# advertising the same `schema_version` always share the same shape. New
+# optional features must register a new entry here.
+_OPTIONAL_DATASET_FEATURES = frozenset(
+    {"observation.velocity", "observation.wrench"}
+)
+DATASET_SCHEMA_VERSIONS: Dict[frozenset, str] = {
+    frozenset(): "0.0.0",
+    frozenset({"observation.wrench"}): "0.1.0",
+    frozenset({"observation.velocity"}): "0.2.0",
+    frozenset({"observation.velocity", "observation.wrench"}): "0.3.0",
+}
+_UNKNOWN_SCHEMA_VERSION = "0.0.0-experimental"
+
+
+def compute_schema_version(features: Dict[str, Any]) -> str:
+    """Derive `task.parquet.schema_version` from the dataset feature key set.
+
+    Historically this label was copied from the collector-side `tags.json` and
+    stayed at "0.1.0" even after the converter silently dropped
+    `observation.wrench` from the dataset features (when `wrench_topic` was
+    missing from the converter config). Computing the version from the actual
+    feature shape keeps the label consistent with what is on disk.
+    """
+    extras = frozenset(features.keys()) & _OPTIONAL_DATASET_FEATURES
+    version = DATASET_SCHEMA_VERSIONS.get(extras)
+    if version is not None:
+        return version
+    logger.warning(
+        "Unknown dataset feature shape: optional features=%s. "
+        "Falling back to %s — register the new shape in "
+        "DATASET_SCHEMA_VERSIONS to bump the version.",
+        sorted(extras),
+        _UNKNOWN_SCHEMA_VERSION,
+    )
+    return _UNKNOWN_SCHEMA_VERSION
+
+
 class DataCreator:
     """
     Creates LeRobot v3.0 datasets from episode data.

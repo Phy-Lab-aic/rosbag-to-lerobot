@@ -47,7 +47,7 @@ from v3_conversion.aic_meta.writer import (
 )
 from v3_conversion.constants import CONFIG_PATH, INPUT_PATH, OUTPUT_PATH
 from v3_conversion.data_converter import frames_to_episode
-from v3_conversion.data_creator import DataCreator
+from v3_conversion.data_creator import DataCreator, compute_schema_version
 from v3_conversion.hz_checker import validate_from_timestamps
 from v3_conversion.mcap_reader import (
     build_extraction_config,
@@ -801,6 +801,15 @@ def run_conversion(
             logger.info("Video timestamps corrected")
             creator.patch_episodes_metadata()
             logger.info("Episode custom metadata patched")
+            dataset_schema_version = compute_schema_version(
+                creator.dataset.features
+            )
+            for row in aic_task_rows:
+                row["schema_version"] = dataset_schema_version
+            logger.info(
+                "task.parquet schema_version set to %s based on dataset features",
+                dataset_schema_version,
+            )
             write_task_parquet(aic_dir / "task.parquet", aic_task_rows)
             write_scoring_parquet(aic_dir / "scoring.parquet", aic_scoring_rows)
             write_scene_parquet(aic_dir / "scene.parquet", aic_scene_rows)

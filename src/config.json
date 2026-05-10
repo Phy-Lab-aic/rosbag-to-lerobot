@@ -20,6 +20,7 @@
     "gripper/left_finger_joint"
   ],
   "state_topic": "/joint_states",
+  "wrench_topic": "/fts_broadcaster/wrench",
   "action_topics_map": {
     "leader": "/joint_states"
   },
